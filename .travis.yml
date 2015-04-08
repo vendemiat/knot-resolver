@@ -1,32 +1,17 @@
 language: c
-os:
-    - linux
-    - osx
 compiler:
     - clang
-notifications:
-    email:
-        on_success: change
-        on_failure: change
-matrix:
-    fast_finish: true
-    allow_failures:
-        - os: osx
 env:
     global:
         - PKG_CONFIG_PATH="${HOME}/.local/lib/pkgconfig"
         - PATH="${HOME}/.local/bin:/usr/local/bin:${PATH}"
         - CFLAGS="${CFLAGS} -O0 -g -fPIC -DNDEBUG"
         - LD_LIBRARY_PATH="${HOME}/.local/lib"
-        - DYLD_LIBRARY_PATH="${HOME}/.local/lib"
-        - MAKEOPTS="-j2"
         - secure: "OfAd7YOX7AETqcqtHB0tMeMWOF8GgjEcqd+AVSj4ZPc/WqWQc9nqpch39ApadHf6kXfSXAlhHhIvQmDwLUoPORq7FAk37VIF2aNBCHBJ+H5S18VEiKdPM1f4fJYlq8akgpR1K7jbzpckht86g1BrzlEzCj8zXrnlRrHOPYEzpWk="
 before_script:
     - ./scripts/bootstrap-depends.sh ${HOME}/.local
 script:
-    - make ${MAKEOPTS} check COVERAGE=1
-after_success:
-    - test $TRAVIS_OS_NAME = linux && coveralls -i lib -x ".c" --gcov-options '\-lp'
+    - make
 sudo: false
 cache:
     directories:
@@ -39,6 +24,5 @@ addons:
       name: "CZ-NIC/knot-resolver"
       description: "Build submitted via Travis CI"
     notification_email: marek.vavrusa@nic.cz
-    build_command_prepend: "make clean"
     build_command:   "make"
     branch_pattern: coverity_scan
