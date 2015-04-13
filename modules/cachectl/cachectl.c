@@ -35,32 +35,6 @@
  * Properties.
  */
 
-/**
- * Return number of cached records.
- *
- * Input:  N/A
- * Output: { size: int }
- * 
- */
-static char* get_size(void *env, struct kr_module *module, const char *args)
-{
-	char *result = NULL;
-	struct engine *engine = env;
-	const namedb_api_t *storage = kr_cache_storage();
-
-	/* Fetch item count */
-	namedb_txn_t txn;
-	int ret = kr_cache_txn_begin(engine->resolver.cache, &txn, NAMEDB_RDONLY);
-	if (ret == 0) {
-		asprintf(&result, "{ \"size\": %d }", storage->count(&txn));
-		kr_cache_txn_abort(&txn);
-	} else {
-		asprintf(&result, "{ \"error\": \"%s\" }", knot_strerror(ret));
-	}
-	
-	return result;
-}
-
 /** Return boolean true if a record in the RR set is expired. */
 static int is_expired(struct kr_cache_rrset *rr, uint32_t drift)
 {
@@ -84,7 +58,7 @@ static int is_expired(struct kr_cache_rrset *rr, uint32_t drift)
  *
  * Input:  N/A
  * Output: { pruned: int }
- * 
+ *
  */
 static char* prune(void *env, struct kr_module *module, const char *args)
 {
@@ -124,7 +98,7 @@ static char* prune(void *env, struct kr_module *module, const char *args)
 	} else {
 		asprintf(&result, "{ \"pruned\": %d }", pruned);
 	}
-	
+
 	return result;
 }
 
@@ -133,7 +107,7 @@ static char* prune(void *env, struct kr_module *module, const char *args)
  *
  * Input:  N/A
  * Output: { result: bool }
- * 
+ *
  */
 static char* clear(void *env, struct kr_module *module, const char *args)
 {
@@ -164,13 +138,12 @@ static char* clear(void *env, struct kr_module *module, const char *args)
 
 struct kr_prop *cachectl_props(void)
 {
-    static struct kr_prop prop_list[] = {
-        { &get_size, "size",  "Return number of cached records.", },
-        { &prune,    "prune", "Prune expired/invalid records.", },
-        { &clear,    "clear", "Clear all cache records.", },
-        { NULL, NULL, NULL }
-    };
-    return prop_list;
+	static struct kr_prop prop_list[] = {
+	    { &prune,    "prune", "Prune expired/invalid records.", },
+	    { &clear,    "clear", "Clear all cache records.", },
+	    { NULL, NULL, NULL }
+	};
+	return prop_list;
 }
 
 KR_MODULE_EXPORT(cachectl);

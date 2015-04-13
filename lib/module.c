@@ -1,3 +1,19 @@
+/*  Copyright (C) 2015 CZ.NIC, z.s.p.o. <knot-dns@labs.nic.cz>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -18,21 +34,19 @@
 
 /** Check ABI version, return error on mismatch. */
 #define ABI_CHECK(m, prefix, symname, required) do { \
-	if ((m)->lib != RTLD_DEFAULT) { \
-	 	module_api_cb *_api = NULL; \
-	 	*(void **) (&_api) = load_symbol((m)->lib, (prefix), (symname)); \
-	 	if (_api == NULL) { \
-	 		return kr_error(ENOENT); \
-	 	} \
-	 	if (_api() != (required)) { \
-	 		return kr_error(ENOTSUP); \
-	 	} \
- 	}\
- } while (0)
+	module_api_cb *_api = NULL; \
+	*(void **) (&_api) = load_symbol((m)->lib, (prefix), (symname)); \
+	if (_api == NULL) { \
+		return kr_error(ENOENT); \
+	} \
+	if (_api() != (required)) { \
+		return kr_error(ENOTSUP); \
+	} \
+} while (0)
 
-/** Load ABI by symbol names. */ 
+/** Load ABI by symbol names. */
 #define ABI_LOAD(m, prefix, s_init, s_deinit, s_config, s_layer, s_prop) do { \
- 	module_prop_cb *module_prop = NULL; \
+	module_prop_cb *module_prop = NULL; \
 	*(void **) (&(m)->init)   = load_symbol((m)->lib, (prefix), (s_init)); \
 	*(void **) (&(m)->deinit) = load_symbol((m)->lib, (prefix), (s_deinit)); \
 	*(void **) (&(m)->config) = load_symbol((m)->lib, (prefix), (s_config)); \
@@ -76,9 +90,9 @@ static int load_library(struct kr_module *module, const char *name, const char *
 /** Load C module symbols. */
 static int load_sym_c(struct kr_module *module, uint32_t api_required)
 {
- 	auto_free char *module_prefix = kr_strcatdup(2, module->name, "_");
- 	ABI_CHECK(module, module_prefix, "api", api_required);
- 	ABI_LOAD(module, module_prefix, "init", "deinit", "config", "layer", "props");
+	auto_free char *module_prefix = kr_strcatdup(2, module->name, "_");
+	ABI_CHECK(module, module_prefix, "api", api_required);
+	ABI_LOAD(module, module_prefix, "init", "deinit", "config", "layer", "props");
 	return kr_ok();
 }
 
@@ -114,7 +128,7 @@ static int bootstrap_libgo(struct kr_module *module)
 	return kr_ok();
 }
 
-/** Load Go module symbols. */ 
+/** Load Go module symbols. */
 static int load_ffi_go(struct kr_module *module, uint32_t api_required)
 {
 	/* Bootstrap libgo */
@@ -149,7 +163,7 @@ int kr_module_load(struct kr_module *module, const char *name, const char *path)
 		auto_free char *local_path = kr_strcatdup(2, getenv("HOME"), "/.local" MODULEDIR);
 		if (load_library(module, name, local_path) != 0) {
 			if (load_library(module, name, PREFIX MODULEDIR) != 0) {
-				module->lib = RTLD_DEFAULT;	
+				module->lib = RTLD_DEFAULT;
 			}
 		}
 	}
@@ -167,7 +181,6 @@ int kr_module_load(struct kr_module *module, const char *name, const char *path)
 	if (ret != 0) {
 		kr_module_unload(module);
 	}
-
 
 	return ret;
 }

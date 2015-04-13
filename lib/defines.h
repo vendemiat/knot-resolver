@@ -15,7 +15,7 @@
  */
 
 /** \addtogroup resolution
- * @{ 
+ * @{
  */
 
 #pragma once
@@ -35,7 +35,7 @@
 /*
  * Connection limits.
  */
-#define KR_CONN_RTT_MAX 10000
+#define KR_CONN_RTT_MAX 5000
 
 /*
  * Timers.
@@ -47,6 +47,6 @@
  */
 #define KR_DNS_PORT   53
 #define KR_EDNS_VERSION 0
-#define KR_EDNS_PAYLOAD 4096  
+#define KR_EDNS_PAYLOAD 4096
 
 /** @} */
