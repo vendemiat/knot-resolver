@@ -21,6 +21,7 @@
 #include <libknot/rrtype/rdname.h>
 
 #include "lib/layer/iterate.h"
+#include "lib/cache.h"
 #include "lib/module.h"
 
 #define DEBUG_MSG(fmt...) QRDEBUG(kr_rplan_current(param->rplan), " cc ",  fmt)
@@ -95,7 +96,7 @@ static int read_cache(knot_layer_t *ctx, knot_pkt_t *pkt)
 	int state = read_cache_rr(txn, &cache_rr, timestamp, callback, param);
 	if (state == KNOT_STATE_DONE) {
 		DEBUG_MSG("=> satisfied from cache\n");
-		cur->resolved = true;
+		cur->flags |= QUERY_RESOLVED;
 		return state;
 	}
 
@@ -110,7 +111,7 @@ static int read_cache(knot_layer_t *ctx, knot_pkt_t *pkt)
 			}
 		}
 
-		cur->resolved = true;
+		cur->flags |= QUERY_RESOLVED;
 		return KNOT_STATE_DONE;
 	}
 
@@ -255,8 +256,9 @@ static int write_cache(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (knot_wire_get_aa(pkt->wire)) {
 		ret = write_cache_answer(pkt, txn, pool, timestamp);
 	}
-
-	ret = write_cache_authority(pkt, txn, pool, timestamp);
+	if (ret == KNOT_EOK) {
+		ret = write_cache_authority(pkt, txn, pool, timestamp);
+	}
 
 	/* Cache full, do what we must. */
 	if (ret == KNOT_ESPACE) {

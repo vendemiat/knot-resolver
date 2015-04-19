@@ -13,7 +13,10 @@ Supported languages
 -------------------
 
 Currently modules written in C are supported.
-There is also a rudimentary support for writing modules in Go |---| |(1)| the library has no native Go bindings, library is accessible using CGO_, |(2)| gc doesn't support building shared libraries, GCCGO_ is required, |(3)| no coroutines and no garbage collecting thread, as the Go code is called from C threads.
+There is also a rudimentary support for writing modules in Go |---|
+(1) the library has no native Go bindings, library is accessible using CGO_,
+(2) gc doesn't support building shared libraries, GCCGO_ is required,
+(3) no coroutines and no garbage collecting thread, as the Go code is called from C threads.
 
 .. note:: There is a plan for Lua scriptables, but it's not implemented yet.
 
@@ -244,11 +247,17 @@ Once you load the module, you can call the module property from the interactive 
 
 *Note* |---| this relies on function pointers, so the same ``static inline`` trick as for the ``Layer()`` is required for C/Go.
 
+Special properties
+------------------
+
+If the module declares properties ``get`` or ``set``, they can be used in the Lua interpreter as
+regular tables.
+
+.. warning:: This is not yet completely implemented, as the module I/O format may change to map_t a/o
+             embedded JSON tokenizer.
+
 .. _`not present in Go`: http://blog.golang.org/gos-declaration-syntax
 .. _CGO: http://golang.org/cmd/cgo/
 .. _GCCGO: https://golang.org/doc/install/gccgo
 
 .. |---| unicode:: U+02014 .. em dash
-.. |(1)| unicode:: U+2474 .. (1)
-.. |(2)| unicode:: U+2475 .. (2)
-.. |(3)| unicode:: U+2476 .. (3)
