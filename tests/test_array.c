@@ -39,11 +39,20 @@ static void test_array(void **state)
 		assert_true(ret >= 0);
 	}
 
+	/* Make sure reservation holds. */
+	assert_true(array_reserve(arr, 5) >= 0);
+
 	/* Delete elements. */
 	array_del(arr, 0);
 	for (size_t i = arr.len; --i;) {
 		ret = array_pop(arr);
 		assert_true(ret == 0);
+	}
+
+	/* Overfill. */
+	for (unsigned i = 0; i < 4096; ++i) {
+		ret = array_push(arr, i);
+		assert_true(ret >= 0);
 	}
 
 	array_clear(arr);

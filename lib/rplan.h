@@ -14,14 +14,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/** \addtogroup rplan
- * @{
- */
-
 #pragma once
 
 #include <sys/time.h>
-
 #include <libknot/dname.h>
 #include <libknot/internal/lists.h>
 #include <libknot/internal/namedb/namedb.h>
@@ -63,8 +58,6 @@ struct kr_query {
  * It also keeps a notion of current zone cut.
  */
 struct kr_rplan {
-	unsigned txn_flags;          /**< Current transaction flags. */
-	namedb_txn_t txn;            /**< Current transaction (may be r/o). */
 	list_t pending;              /**< List of pending queries. */
 	list_t resolved;             /**< List of resolved queries. */
 	struct kr_context *context;  /**< Parent resolution context. */
@@ -91,23 +84,6 @@ void kr_rplan_deinit(struct kr_rplan *rplan);
  * @return true or false
  */
 bool kr_rplan_empty(struct kr_rplan *rplan);
-
-/**
- * Acquire rplan transaction (read or write only).
- * @note The transaction is shared during the whole resolution, read only transactions
- *       may be promoted to write-enabled transactions if requested, but never demoted.
- * @param rplan plan instance
- * @param flags transaction flags
- * @return transaction instance or NULL
- */
-namedb_txn_t *kr_rplan_txn_acquire(struct kr_rplan *rplan, unsigned flags);
-
-/**
- * Commit any existing transaction, read-only transactions may be just aborted.
- * @param rplan plan instance
- * @return KNOT_E*
- */
-int kr_rplan_txn_commit(struct kr_rplan *rplan);
 
 /**
  * Push a query to the top of the resolution plan.
@@ -142,5 +118,3 @@ struct kr_query *kr_rplan_current(struct kr_rplan *rplan);
  * Return true if resolution chain satisfies given query.
  */
 bool kr_rplan_satisfies(struct kr_query *closure, const knot_dname_t *name, uint16_t cls, uint16_t type);
-
-/** @} */
