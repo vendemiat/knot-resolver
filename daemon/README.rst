@@ -62,14 +62,11 @@ Configuration example
 .. code-block:: lua
 
 	-- 10MB cache
-	cache.open(10*MB)
-	-- static hints
-	modules = {
-		hints = true,
-		cachectl = true
-	}
+	cache.size = 10*MB
+	-- load some modules
+	modules = { 'hints', 'cachectl' }
 	-- interfaces
-	net.listen('127.0.0.1')
+	net = { '127.0.0.1' }
 
 Configuration syntax
 --------------------
@@ -84,10 +81,10 @@ A simple example would be to load static hints.
 .. code-block:: lua
 
 	modules = {
-		cachectl = true -- no configuration
+		'hints' -- no configuration
 	}
 
-If the module accepts accepts configuration, you can provide a table.
+If the module accepts accepts configuration, you can call the ``module.config({...})`` or provide options table.
 The syntax for table is ``{ key1 = value, key2 = value }``, and it represents the unpacked `JSON-encoded`_ string, that
 the modules use as the :ref:`input configuration <mod-properties>`.
 
@@ -95,12 +92,12 @@ the modules use as the :ref:`input configuration <mod-properties>`.
 
 	modules = {
 		cachectl = true,
-		hints = {
+		hints = { -- with configuration
 			file = '/etc/hosts'
 		}
 	}
 
-The possible simple data types are strings, integers or floats and boolean.
+The possible simple data types are: string, integer or float, and boolean.
 
 .. tip:: The configuration and CLI syntax is Lua language, with which you may already be familiar with.
          If not, you can read the `Learn Lua in 15 minutes`_ for a syntax overview. Spending just a few minutes
@@ -112,16 +109,16 @@ The possible simple data types are strings, integers or floats and boolean.
 Dynamic configuration
 ^^^^^^^^^^^^^^^^^^^^^
 
-Knowing that the the configuration is a valid Lua script enables you to write dynamic rules, and also avoid
-additional configuration templating. One example is to differentiate between internal and external
-interfaces based on environment variable.
+Knowing that the the configuration is a Lua in disguise enables you to write dynamic rules, and also avoid
+repetition and templating. This is unavoidable with static configuration, e.g. when you want to configure
+each node a little bit differently.
 
 .. code-block:: lua
 
 	if hostname() == 'hidden' then
-		net.listen(net.eth0)
+		net.listen(net.eth0, 5353)
 	else
-		net.listen(net.eth1.addr[1])
+		net = { '127.0.0.1', net.eth1.addr[1] }
 	end
 
 Another example would show how it is possible to bind to all interfaces, using iteration.
@@ -147,25 +144,61 @@ to download cache from parent, to avoid cold-cache start.
 			sink = ltn12.sink.file(io.open('cache.mdb', 'w'))
 		}
 		-- reopen cache with 100M limit
-		cache.open('.', 100*MB)
+		cache.open(100*MB)
 	end
 
 Events and services
 ^^^^^^^^^^^^^^^^^^^
 
-The Lua supports a concept called closures, this is extremely useful for scripting actions upon various events.
+The Lua supports a concept called closures_, this is extremely useful for scripting actions upon various events,
+say for example - prune the cache within minute after loading, publish statistics each 5 minutes and so on.
+Here's an example of an anonymous function with :func:`event.recurrent()`:
 
-.. note:: Work in progress, come back later!
+.. code-block:: lua
 
-* Timers and events
+	-- every 5 minutes
+	event.recurrent(5 * minute, function()
+		cachectl.prune()
+	end)
+
+Note that each scheduled event is identified by a number valid for the duration of the event,
+you may cancel it at any time. You can do this with anonymous functions, if you accept the event
+as a parameter, but it's not very useful as you don't have any *non-global* way to keep persistent variables.
+
+.. code-block:: lua
+
+	-- make a closure, encapsulating counter
+	function pruner()
+		local i = 0
+		-- pruning function
+		return function(e)
+			cachectl.prune()
+			-- cancel event on 5th attempt
+			i = i + 1
+			if i == 5 then
+				event.cancel(e)
+			fi
+		end
+	end
+
+	-- make recurrent event that will cancel after 5 times
+	event.recurrent(5 * minute, pruner())
+
 * File watchers
 * Data I/O
 
+.. note:: Work in progress, come back later!
+
+.. _closures: http://www.lua.org/pil/6.1.html
 
 Configuration reference
 -----------------------
 
 This is a reference for variables and functions available to both configuration file and CLI.
+
+.. contents::
+   :depth: 1
+   :local:
 
 Environment
 ^^^^^^^^^^^
@@ -184,6 +217,14 @@ Environment
 
 Network configuration
 ^^^^^^^^^^^^^^^^^^^^^
+
+For when listening on ``localhost`` just doesn't cut it.
+
+.. tip:: Use declarative interface for network.
+
+         .. code-block:: lua
+
+         	net = { '127.0.0.1', net.eth0, net.eth1.addr[1] }
 
 .. function:: net.listen(address, [port = 53])
 
@@ -262,6 +303,7 @@ The daemon provides an interface for dynamic loading of :ref:`daemon modules <mo
 
          .. code-block:: lua
 
+         	modules = { 'cachectl' }
 		modules = {
 			hints = {file = '/etc/hosts'}
 		}
@@ -271,7 +313,8 @@ The daemon provides an interface for dynamic loading of :ref:`daemon modules <mo
          .. code-block:: lua
 
 		modules.load('cachectl')
-		cachectl.config({file = '/etc/hosts'})
+		modules.load('hints')
+		hints.config({file = '/etc/hosts'})
 
 
 .. function:: modules.list()
@@ -299,7 +342,41 @@ The cache in Knot DNS Resolver is persistent with LMDB backend, this means that 
 the cached data on restart or crash to avoid cold-starts. The cache may be reused between cache
 daemons or manipulated from other processes, making for example synchronised load-balanced recursors possible.
 
-.. function:: cache.open(max_size)
+.. envvar:: cache.size (number)
+
+   Get/set the cache maximum size in bytes. Note that this is only a hint to the backend,
+   which may or may not respect it. See :func:`cache.open()`.
+
+   .. code-block:: lua
+
+	print(cache.size)
+	cache.size = 100 * MB -- equivalent to `cache.open(100 * MB)`
+
+.. envvar:: cache.storage (string)
+
+   Get or change the cache storage backend configuration, see :func:`cache.backends()` for
+   more information. If the new storage configuration is invalid, it is not set.
+
+   .. code-block:: lua
+
+	print(cache.storage)
+	cache.storage = 'lmdb://.'
+
+.. function:: cache.backends()
+
+   :return: map of backends
+
+   The cache supports runtime-changeable backends, using the optional :rfc:`3986` URI, where the scheme
+   represents backend protocol and the rest of the URI backend-specific configuration. By default, it
+   is a ``lmdb`` backend in working directory, i.e. ``lmdb://``.
+
+   Example output:
+
+   .. code-block:: lua
+
+   	[lmdb://] => true
+
+.. function:: cache.open(max_size[, config_uri])
 
    :param number max_size: Maximum cache size in bytes.
    :return: boolean
@@ -308,6 +385,13 @@ daemons or manipulated from other processes, making for example synchronised loa
    Note that the max_size cannot be lowered, only increased due to how cache is implemented.
 
    .. tip:: Use ``kB, MB, GB`` constants as a multiplier, e.g. ``100*MB``.
+
+   The cache supports runtime-changeable backends, see :func:`cache.backends()` for mor information and
+   default. Refer to specific documentation of specific backends for configuration string syntax.
+
+   - ``lmdb://``
+
+   As of now it only allows you to change the cache directory, e.g. ``lmdb:///tmp/cachedir``.
 
 .. function:: cache.count()
 
@@ -318,6 +402,58 @@ daemons or manipulated from other processes, making for example synchronised loa
    :return: boolean
 
    Close the cache.
+
+   .. note:: This may or may not clear the cache, depending on the used backend. See :func:`cachectl.clear()`. 
+
+Timers and events
+^^^^^^^^^^^^^^^^^
+
+The timer represents exactly the thing described in the examples - it allows you to execute closures 
+after specified time, or event recurrent events. Time is always described in milliseconds,
+but there are convenient variables that you can use - ``sec, minute, hour``.
+For example, ``5 * hour`` represents five hours, or 5*60*60*100 milliseconds.
+
+.. function:: event.after(time, function)
+
+   :return: event id
+
+   Execute function after the specified time has passed.
+   The first parameter of the callback is the event itself.
+
+   Example:
+
+   .. code-block:: lua
+
+	event.after(1 * minute, function() print('Hi!') end)
+
+.. function:: event.recurrent(interval, function)
+
+   :return: event id
+
+   Similar to :func:`event.after()`, periodically execute function after ``interval`` passes. 
+
+   Example:
+
+   .. code-block:: lua
+
+	msg_count = 0
+	event.recurrent(5 * sec, function(e) 
+		msg_count = msg_count + 1
+		print('Hi #'..msg_count)
+	end)
+
+.. function:: event.cancel(event_id)
+
+   Cancel running event, it has no effect on already canceled events.
+   New events may reuse the event_id, so the behaviour is undefined if the function
+   is called after another event is started.
+
+   Example:
+
+   .. code-block:: lua
+
+	e = event.after(1 * minute, function() print('Hi!') end)
+	event.cancel(e)
 
 .. _`JSON-encoded`: http://json.org/example
 .. _`Learn Lua in 15 minutes`: http://tylerneylon.com/a/learn-lua/

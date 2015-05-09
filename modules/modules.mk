@@ -2,6 +2,11 @@
 modules_TARGETS := hints \
                    cachectl
 
+# List of Lua modules
+ifeq ($(HAS_lua),yes)
+modules_TARGETS += ketcd 
+endif
+
 # List of Golang modules
 ifeq ($(HAS_gccgo),yes)
 modules_TARGETS += gostats
@@ -10,6 +15,21 @@ endif
 # Make C module
 define make_c_module
 $(eval $(call make_module,$(1),modules/$(1)))
+endef
+
+# Make Lua module
+define make_lua_module
+$(eval $(call lua_target,$(1),modules/$(1)))
+endef
+
+# Lua target definition
+define lua_target
+$(1) := $$(addprefix $(2)/,$$($(1)_SOURCES))
+$(1)-clean:
+$(1)-install: $$(addprefix $(2)/,$$($(1)_SOURCES))
+	$(INSTALL) -d $(PREFIX)/$(MODULEDIR)
+	$(INSTALL) $$^ $(PREFIX)/$(MODULEDIR)
+.PHONY: $(1) $(1)-install $(1)-clean
 endef
 
 # Make Go module

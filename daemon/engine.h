@@ -24,10 +24,21 @@ struct lua_State;
 #include "lib/resolve.h"
 #include "daemon/network.h"
 
+/** Cache storage backend. */
+struct storage_api {
+	const char *prefix; /**< Storage prefix, e.g. 'lmdb://' */
+	const namedb_api_t *(*api)(void); /**< Storage API implementation */
+	void *(*opts_create)(const char *, size_t); /**< Storage options factory */
+};
+
+/** @internal Array of cache backend options. */
+typedef array_t(struct storage_api) storage_registry_t;
+
 struct engine {
     struct kr_context resolver;
     struct network net;
     module_array_t modules;
+    storage_registry_t storage_registry;
     mm_ctx_t *pool;
     struct lua_State *L;
 };
@@ -40,5 +51,9 @@ void engine_stop(struct engine *engine);
 int engine_register(struct engine *engine, const char *module);
 int engine_unregister(struct engine *engine, const char *module);
 void engine_lualib(struct engine *engine, const char *name, int (*lib_cb) (struct lua_State *));
+
+/** Execute current chunk in the sandbox */
+int engine_pcall(struct lua_State *L, int argc);
+
 /** Return engine light userdata. */
 struct engine *engine_luaget(struct lua_State *L);

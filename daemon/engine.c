@@ -16,10 +16,13 @@
 
 #include <uv.h>
 #include <unistd.h>
-#include <libknot/internal/mem.h>
+#include <libknot/internal/mempattern.h>
+/* #include <libknot/internal/namedb/namedb_trie.h> @todo Not supported (doesn't keep value copy) */
+#include <libknot/internal/namedb/namedb_lmdb.h>
 
 #include "daemon/engine.h"
 #include "daemon/bindings.h"
+#include "daemon/ffimodule.h"
 #include "lib/cache.h"
 #include "lib/defines.h"
 
@@ -71,6 +74,10 @@ static int l_trampoline(lua_State *L)
 	struct kr_module *module = lua_touserdata(L, lua_upvalueindex(1));
 	void* callback = lua_touserdata(L, lua_upvalueindex(2));
 	struct engine *engine = engine_luaget(L);
+	if (!module) {
+		lua_pushstring(L, "module closure missing upvalue");
+		lua_error(L);
+	}
 
 	/* Now we only have property callback or config,
 	 * if we expand the callables, we might need a callback_type.
@@ -93,6 +100,18 @@ static int l_trampoline(lua_State *L)
  * Engine API.
  */
 
+/** @internal Make lmdb options. */
+void *namedb_lmdb_mkopts(const char *conf, size_t maxsize)
+{
+	struct namedb_lmdb_opts *opts = malloc(sizeof(*opts));
+	if (opts) {
+		memset(opts, 0, sizeof(*opts));
+		opts->path = (conf && strlen(conf)) ? conf : ".";
+		opts->mapsize = maxsize;
+	}
+	return opts;
+}
+
 static int init_resolver(struct engine *engine)
 {
 	/* Open resolution context */
@@ -100,9 +119,15 @@ static int init_resolver(struct engine *engine)
 
 	/* Load basic modules */
 	engine_register(engine, "iterate");
-	engine_register(engine, "itercache");
+	engine_register(engine, "rrcache");
+	engine_register(engine, "pktcache");
 
-	return kr_ok();
+	/* Initialize storage backends */
+	struct storage_api lmdb = {
+		"lmdb://", namedb_lmdb_api, namedb_lmdb_mkopts
+	};
+
+	return array_push(engine->storage_registry, lmdb);
 }
 
 static int init_state(struct engine *engine)
@@ -164,6 +189,7 @@ void engine_deinit(struct engine *engine)
 		kr_module_unload(&engine->modules.at[i]);
 	}
 	array_clear(engine->modules);
+	array_clear(engine->storage_registry);
 
 	if (engine->L) {
 		lua_close(engine->L);
@@ -172,8 +198,7 @@ void engine_deinit(struct engine *engine)
 	kr_cache_close(engine->resolver.cache);
 }
 
-/** Execute current chunk in the sandbox */
-static int l_sandboxcall(lua_State *L, int argc)
+int engine_pcall(lua_State *L, int argc)
 {
 #if LUA_VERSION_NUM >= 502
 	lua_getglobal(L, "_SANDBOX");
@@ -193,7 +218,7 @@ int engine_cmd(struct engine *engine, const char *str)
 	lua_pushstring(engine->L, str);
 
 	/* Check result. */
-	if (l_sandboxcall(engine->L, 1) != 0) {
+	if (engine_pcall(engine->L, 1) != 0) {
 		fprintf(stderr, "%s\n", lua_tostring(engine->L, -1));
 		lua_pop(engine->L, 1);
 		return kr_error(EINVAL);
@@ -207,7 +232,7 @@ int engine_cmd(struct engine *engine, const char *str)
 	(luaL_loadbuffer((L), (arr), (len), (name)) || lua_pcall((L), 0, LUA_MULTRET, 0))
 /** Load file in a sandbox environment. */
 #define l_dosandboxfile(L, filename) \
-	(luaL_loadfile((L), (filename)) || l_sandboxcall((L), 0))
+	(luaL_loadfile((L), (filename)) || engine_pcall((L), 0))
 
 static int engine_loadconf(struct engine *engine)
 {
@@ -220,6 +245,8 @@ static int engine_loadconf(struct engine *engine)
 		lua_pop(engine->L, 1);
 		return kr_error(ENOEXEC);
 	}
+	/* Use module path for including Lua scripts */
+	engine_cmd(engine, "package.path = package.path..';" PREFIX MODULEDIR "/?.lua'");
 
 	/* Load config file */
 	int ret = 0;
@@ -237,10 +264,8 @@ static int engine_loadconf(struct engine *engine)
 	if (ret != 0) {
 		fprintf(stderr, "%s\n", lua_tostring(engine->L, -1));
 		lua_pop(engine->L, 1);
-		return kr_error(EINVAL);
 	}
-
-	return kr_ok();
+	return ret;
 }
 
 int engine_start(struct engine *engine)
@@ -276,7 +301,7 @@ static int register_properties(struct engine *engine, struct kr_module *module)
 	/* Register module in Lua env */
 	lua_getglobal(engine->L, "modules_register");
 	lua_getglobal(engine->L, module->name);
-	if (l_sandboxcall(engine->L, 1) != 0) {
+	if (engine_pcall(engine->L, 1) != 0) {
 		lua_pop(engine->L, 1);
 	}
 
@@ -291,12 +316,15 @@ int engine_register(struct engine *engine, const char *name)
 
 	/* Make sure module is unloaded */
 	(void) engine_unregister(engine, name);
-
-	/* Load module */
+	/* Attempt to load binary module */
 	size_t next = engine->modules.len;
 	array_reserve(engine->modules, next + 1);
 	struct kr_module *module = &engine->modules.at[next];
 	int ret = kr_module_load(module, name, NULL);
+	/* Load Lua module if not a binary */
+	if (ret == kr_error(ENOENT)) {
+		ret = ffimodule_register_lua(engine, module, name);
+	}
 	if (ret != 0) {
 		return ret;
 	} else {

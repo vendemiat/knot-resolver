@@ -2,6 +2,10 @@
 kB = 1024
 MB = 1024*1024
 GB = 1024*1024
+-- Time
+sec = 1000
+minute = 60 * sec
+hour = 60 * minute
 
 -- Function aliases
 -- `env.VAR returns os.getenv(VAR)`
@@ -12,11 +16,18 @@ setmetatable(env, {
 
 -- Quick access to interfaces
 -- `net.<iface>` => `net.interfaces()[iface]`
+-- `net = {addr1, ..}` => `net.listen(name, addr1)`
 setmetatable(net, {
 	__index = function (t, k)
 		local v = rawget(t, k)
 		if v then return v
 		else return net.interfaces()[k]
+		end
+	end,
+	__newindex = function (t,k,v)
+		local iname = rawget(net.interfaces(), v)
+		if iname then t.listen(iname)
+		else t.listen(v)
 		end
 	end
 })
@@ -25,14 +36,25 @@ setmetatable(net, {
 -- `modules.<name> = <config>`
 setmetatable(modules, {
 	__newindex = function (t,k,v)
+		if type(k) == 'number' then k = v end
 		if not rawget(_G, k) then
 			modules.load(k)
 			local mod = rawget(_G, k)
-			if mod and mod['config'] then
+			if k ~= v and mod and mod['config'] then
 				mod['config'](v)
 			end
 
 		end
+	end
+})
+
+-- Syntactic sugar for cache
+-- `cache.{size|storage} = value`
+setmetatable(cache, {
+	__newindex = function (t,k,v)
+		if     k == 'size'    then t.open(v, rawget(t, 'storage'))
+		elseif k == 'storage' then t.open(rawget(t, 'size'), v)
+		else   rawset(t, k, v) end
 	end
 })
 

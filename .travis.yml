@@ -1,6 +1,11 @@
 language: c
 compiler:
     - clang
+notifications:
+    email:
+        on_success: change
+        on_failure: change
+    slack: cznic:xNJmvHU2xu2aGtN7Y2eqHKoD
 env:
     global:
         - PKG_CONFIG_PATH="${HOME}/.local/lib/pkgconfig"

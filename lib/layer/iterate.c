@@ -18,9 +18,8 @@
 
 #include <libknot/descriptor.h>
 #include <libknot/rrtype/rdname.h>
-#include <libknot/processing/requestor.h>
-#include <dnssec/random.h>
 
+#include "ccan/isaac/isaac.h"
 #include "lib/layer/iterate.h"
 #include "lib/resolve.h"
 #include "lib/rplan.h"
@@ -28,18 +27,23 @@
 #include "lib/nsrep.h"
 #include "lib/module.h"
 
+#define SEED_SIZE 256
 #define DEBUG_MSG(fmt...) QRDEBUG(kr_rplan_current(&req->rplan), "iter", fmt)
-
-/* Packet classification. */
-enum {
-	PKT_NOERROR   = 1 << 0, /* Positive response */
-	PKT_NODATA    = 1 << 1, /* No data response */
-	PKT_NXDOMAIN  = 1 << 2, /* Negative response */
-	PKT_ERROR     = 1 << 3  /* Refused or server failure */
-};
 
 /* Iterator often walks through packet section, this is an abstraction. */
 typedef int (*rr_callback_t)(const knot_rrset_t *, unsigned, struct kr_request *);
+
+/** @internal CSPRNG context */
+static isaac_ctx ISAAC;
+
+/** @internal Reseed isaac context. */
+int iterate_init(struct kr_module *module)
+{
+	uint8_t seed[SEED_SIZE];
+	kr_randseed((char *)seed, sizeof(seed));
+	isaac_reseed(&ISAAC, seed, sizeof(seed));
+	return kr_ok();
+}
 
 /** Return minimized QNAME/QTYPE for current zone cut. */
 static const knot_dname_t *minimized_qname(struct kr_query *query, uint16_t *qtype)
@@ -96,8 +100,7 @@ static bool is_authoritative(const knot_pkt_t *answer, struct kr_query *query)
 	return false;
 }
 
-/** Return response class. */
-static int response_classify(knot_pkt_t *pkt)
+int kr_response_classify(knot_pkt_t *pkt)
 {
 	const knot_pktsection_t *an = knot_pkt_section(pkt, KNOT_ANSWER);
 	switch (knot_wire_get_rcode(pkt->wire)) {
@@ -244,22 +247,22 @@ static int process_authority(knot_pkt_t *pkt, struct kr_request *req)
 	return result;
 }
 
-static void finalize_answer(knot_pkt_t *pkt, struct kr_request *req)
+static void finalize_answer(knot_pkt_t *pkt, struct kr_query *qry, struct kr_request *req)
 {
 	/* Finalize header */
 	knot_pkt_t *answer = req->answer;
 	knot_wire_set_rcode(answer->wire, knot_wire_get_rcode(pkt->wire));
 
-	/* Fill in SOA if negative response */
+	/* Fill in bailiwick records in authority */
+	struct kr_zonecut *cut = &qry->zone_cut;
 	knot_pkt_begin(answer, KNOT_AUTHORITY);
-	int pkt_class = response_classify(pkt);
+	int pkt_class = kr_response_classify(pkt);
 	if (pkt_class & (PKT_NXDOMAIN|PKT_NODATA)) {
 		const knot_pktsection_t *ns = knot_pkt_section(pkt, KNOT_AUTHORITY);
 		for (unsigned i = 0; i < ns->count; ++i) {
 			const knot_rrset_t *rr = knot_pkt_rr(ns, i);
-			if (rr->type == KNOT_RRTYPE_SOA) {
+			if (knot_dname_in(cut->name, rr->owner)) {
 				rr_update_answer(rr, 0, req);
-				break;
 			}
 		}
 	}
@@ -275,7 +278,7 @@ static int process_answer(knot_pkt_t *pkt, struct kr_request *req)
 	 * NXDOMAIN => parent is zone cut, retry as a workaround for bad authoritatives
 	 */
 	bool is_final = (query->parent == NULL);
-	int pkt_class = response_classify(pkt);
+	int pkt_class = kr_response_classify(pkt);
 	if (!knot_dname_is_equal(knot_pkt_qname(pkt), query->sname) &&
 	    (pkt_class & (PKT_NOERROR|PKT_NXDOMAIN|PKT_NODATA))) {
 		DEBUG_MSG("<= found cut, retrying with non-minimized name\n");
@@ -307,7 +310,7 @@ static int process_answer(knot_pkt_t *pkt, struct kr_request *req)
 		(void) kr_rplan_push(&req->rplan, query->parent, cname, query->sclass, query->stype);
 	} else {
 		if (query->parent == NULL) {
-			finalize_answer(pkt, req);
+			finalize_answer(pkt, query, req);
 		}
 	}
 
@@ -338,8 +341,7 @@ static int prepare_query(knot_layer_t *ctx, knot_pkt_t *pkt)
 	assert(pkt && ctx);
 	struct kr_request *req = ctx->data;
 	struct kr_query *query = kr_rplan_current(&req->rplan);
-	if (query == NULL || ctx->state == KNOT_STATE_DONE) {
-		assert(0);
+	if (!query || ctx->state & (KNOT_STATE_DONE|KNOT_STATE_FAIL)) {
 		return ctx->state;
 	}
 
@@ -354,25 +356,21 @@ static int prepare_query(knot_layer_t *ctx, knot_pkt_t *pkt)
 		return KNOT_STATE_FAIL;
 	}
 
-	query->id = dnssec_random_uint16_t();
-	knot_wire_set_id(pkt->wire, query->id);
-
-	/* Declare EDNS0 support. */
-	knot_rrset_t opt_rr;
-	ret = knot_edns_init(&opt_rr, KR_EDNS_PAYLOAD, 0, KR_EDNS_VERSION, &pkt->mm);
-	if (ret != KNOT_EOK) {
-		return KNOT_STATE_FAIL;
-	}
-
-	knot_pkt_begin(pkt, KNOT_ADDITIONAL);
-	ret = knot_pkt_put(pkt, KNOT_COMPR_HINT_NONE, &opt_rr, KNOT_PF_FREE);
-	if (ret != KNOT_EOK) {
-		knot_rrset_clear(&opt_rr, &pkt->mm);
-		return KNOT_STATE_FAIL;
-	}
-
 	/* Query built, expect answer. */
+	query->id = isaac_next_uint(&ISAAC, UINT16_MAX);
+	knot_wire_set_id(pkt->wire, query->id);
 	return KNOT_STATE_CONSUME;
+}
+
+static int resolve_badmsg(knot_pkt_t *pkt, struct kr_request *req, struct kr_query *query)
+{
+	/* Work around broken auths/load balancers */
+	if (query->flags & QUERY_SAFEMODE) {
+		return resolve_error(pkt, req);
+	} else {
+		query->flags |= QUERY_SAFEMODE;
+		return KNOT_STATE_DONE;
+	}
 }
 
 /** Resolve input query or continue resolution with followups.
@@ -384,14 +382,14 @@ static int resolve(knot_layer_t *ctx, knot_pkt_t *pkt)
 	assert(pkt && ctx);
 	struct kr_request *req = ctx->data;
 	struct kr_query *query = kr_rplan_current(&req->rplan);
-	if (query == NULL || (query->flags & QUERY_RESOLVED)) {
+	if (!query || (query->flags & QUERY_RESOLVED)) {
 		return ctx->state;
 	}
 
 	/* Check for packet processing errors first. */
 	if (pkt->parsed < pkt->size) {
 		DEBUG_MSG("<= malformed response\n");
-		return resolve_error(pkt, req);
+		return resolve_badmsg(pkt, req, query);
 	} else if (!is_paired_to_query(pkt, query)) {
 		DEBUG_MSG("<= ignoring mismatching response\n");
 		return KNOT_STATE_CONSUME;
@@ -416,6 +414,10 @@ static int resolve(knot_layer_t *ctx, knot_pkt_t *pkt)
 	case KNOT_RCODE_NOERROR:
 	case KNOT_RCODE_NXDOMAIN:
 		break; /* OK */
+	case KNOT_RCODE_FORMERR:
+	case KNOT_RCODE_NOTIMPL:
+		DEBUG_MSG("<= rcode: %s\n", rcode ? rcode->name : "??");
+		return resolve_badmsg(pkt, req, query);
 	default:
 		DEBUG_MSG("<= rcode: %s\n", rcode ? rcode->name : "??");
 		return resolve_error(pkt, req);
@@ -440,7 +442,7 @@ static int resolve(knot_layer_t *ctx, knot_pkt_t *pkt)
 }
 
 /** Module implementation. */
-const knot_layer_api_t *iterate_layer(void)
+const knot_layer_api_t *iterate_layer(struct kr_module *module)
 {
 	static const knot_layer_api_t _layer = {
 		.begin = &begin,
