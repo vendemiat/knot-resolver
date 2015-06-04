@@ -52,13 +52,12 @@ static PyObject* init(PyObject* self, PyObject* args)
 
 	/* Load basic modules. */
 	array_init(global_modules);
-	int ret = array_reserve(global_modules, 2);
-	if (ret < 0) {
-		return NULL;
+	const char *load_modules[3] = {"iterate", "rrcache", "pktcache"};
+	for (unsigned i = 0; i < 3; ++i) {
+		struct kr_module *mod = malloc(sizeof(*mod));
+		kr_module_load(mod, load_modules[i], NULL);
+		array_push(global_modules, mod);
 	}
-	kr_module_load(&global_modules.at[0], "iterate", NULL);
-	kr_module_load(&global_modules.at[1], "rrcache", NULL);
-	global_modules.len = 2;
 
 	/* Initialize resolution context */
 	mm_ctx_init(&global_mm);
@@ -66,14 +65,23 @@ static PyObject* init(PyObject* self, PyObject* args)
 	global_context.pool = &global_mm;
 	global_context.modules = &global_modules;
 
+	/* Create cache */
 	global_tmpdir = test_tmpdir_create();
 	assert(global_tmpdir);
 	struct namedb_lmdb_opts opts;
 	memset(&opts, 0, sizeof(opts));
 	opts.path = global_tmpdir;
 	opts.mapsize = 100 * 4096;
-	global_context.cache = kr_cache_open(&opts, &global_mm);
-	assert(global_context.cache);
+	int ret = kr_cache_open(&global_context.cache, NULL, &opts, &global_mm);
+	if (ret != 0) {
+	    return NULL;
+	}
+
+	/* Create RTT tracking */
+	global_context.nsrep = malloc(lru_size(kr_nsrep_lru_t, 1000));
+	assert(global_context.nsrep);
+	lru_init(global_context.nsrep, 1000);
+	global_context.options = QUERY_NO_THROTTLE;
 
 	/* No configuration parsing support yet. */
 	if (strstr(config, "query-minimization: on") == NULL) {
@@ -90,9 +98,12 @@ static PyObject* deinit(PyObject* self, PyObject* args)
 	}
 
 	for (size_t i = 0; i < global_modules.len; ++i) {
-		kr_module_unload(&global_modules.at[i]);
+		kr_module_unload(global_modules.at[i]);
 	}
 	array_clear(global_modules);
+	kr_cache_close(&global_context.cache);
+	lru_deinit(global_context.nsrep);
+	free(global_context.nsrep);
 
 	test_tmpdir_remove(global_tmpdir);
 	global_tmpdir = NULL;
@@ -142,7 +153,7 @@ static PyObject* set_time(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
-	g_mock_time.tv_sec  = arg_time;
+	g_mock_time.tv_sec  += arg_time;
 	g_mock_time.tv_usec = 0;
 
 	return Py_BuildValue("");

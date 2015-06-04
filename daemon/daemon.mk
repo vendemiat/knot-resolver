@@ -1,4 +1,7 @@
+kresolved_EMBED := \
+	contrib/ccan/json/json.c
 kresolved_SOURCES := \
+	$(kresolved_EMBED)   \
 	daemon/io.c          \
 	daemon/network.c     \
 	daemon/engine.c      \
@@ -10,7 +13,7 @@ kresolved_SOURCES := \
 # Embed resources
 daemon/engine.o: daemon/lua/sandbox.inc daemon/lua/config.inc
 %.inc: %.lua
-	@$(call quiet,XXD,$<) -i - < $< > $@
+	@$(call quiet,XXD,$<) $< > $@
 
 # Dependencies
 kresolved_DEPEND := $(libkresolve)

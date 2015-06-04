@@ -21,8 +21,10 @@
 #include <libknot/packet/pkt.h>
 
 #include "lib/generic/array.h"
+#include "lib/nsrep.h"
 #include "lib/rplan.h"
 #include "lib/module.h"
+#include "lib/cache.h"
 
 /**
  * @file resolve.h
@@ -84,7 +86,7 @@
  */
 
 /* @cond internal Array of modules. */
-typedef array_t(struct kr_module) module_array_t;
+typedef array_t(struct kr_module *) module_array_t;
 /* @endcond */
 
 /**
@@ -98,7 +100,8 @@ typedef array_t(struct kr_module) module_array_t;
 struct kr_context
 {
 	mm_ctx_t *pool;
-	struct kr_cache *cache;
+	struct kr_cache cache;
+	kr_nsrep_lru_t *nsrep;
 	module_array_t *modules;
 	uint32_t options;
 };

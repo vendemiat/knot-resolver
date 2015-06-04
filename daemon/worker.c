@@ -27,14 +27,10 @@
 struct qr_task
 {
 	struct kr_request req;
+	struct worker_ctx *worker;
 	knot_pkt_t *next_query;
 	uv_handle_t *next_handle;
 	uv_timer_t timeout;
-	union {
-		uv_write_t tcp_send;
-		uv_udp_send_t udp_send;
-		uv_connect_t connect;
-	} ioreq;
 	struct {
 		union {
 			struct sockaddr_in ip4;
@@ -65,10 +61,17 @@ static int parse_query(knot_pkt_t *query)
 	return kr_ok();
 }
 
-static struct qr_task *qr_task_create(struct worker_ctx *worker, uv_handle_t *handle, const struct sockaddr *addr)
+static struct qr_task *qr_task_create(struct worker_ctx *worker, uv_handle_t *handle, knot_pkt_t *query, const struct sockaddr *addr)
 {
+	/* Recycle mempool from ring or create it */
 	mm_ctx_t pool;
-	mm_ctx_mempool(&pool, MM_DEFAULT_BLKSIZE);
+	mempool_ring_t *ring = &worker->bufs.ring;
+	if (ring->len > 0) {
+		pool = array_tail(*ring);
+		array_pop(*ring);
+	} else {
+		mm_ctx_mempool(&pool, KNOT_WIRE_MAX_PKTSIZE);
+	}
 
 	/* Create worker task */
 	struct engine *engine = worker->engine;
@@ -78,21 +81,35 @@ static struct qr_task *qr_task_create(struct worker_ctx *worker, uv_handle_t *ha
 		mp_delete(pool.ctx);
 		return NULL;
 	}
+	task->worker = worker;
 	task->req.pool = pool;
 	task->source.handle = handle;
 	if (addr) {
 		memcpy(&task->source.addr, addr, sockaddr_len(addr));
 	}
 
+	/* How much can client handle? */
+	size_t answer_max = KNOT_WIRE_MIN_PKTSIZE;
+	if (!addr) { /* TCP */
+		answer_max = KNOT_WIRE_MAX_PKTSIZE;
+	} else if (knot_pkt_has_edns(query)) { /* EDNS */
+		answer_max = knot_edns_get_payload(query->opt_rr);
+	}
+	/* How much space do we need for intermediate packets? */
+	size_t pktbuf_max = KNOT_EDNS_MAX_UDP_PAYLOAD;
+	if (pktbuf_max < answer_max) {
+		pktbuf_max = answer_max;
+	}
+
 	/* Create buffers */
-	knot_pkt_t *next_query = knot_pkt_new(NULL, KNOT_EDNS_MAX_UDP_PAYLOAD, &task->req.pool);
-	knot_pkt_t *answer = knot_pkt_new(NULL, KNOT_WIRE_MAX_PKTSIZE, &task->req.pool);
-	if (!next_query || !answer) {
+	knot_pkt_t *pktbuf = knot_pkt_new(NULL, pktbuf_max, &task->req.pool);
+	knot_pkt_t *answer = knot_pkt_new(NULL, answer_max, &task->req.pool);
+	if (!pktbuf || !answer) {
 		mp_delete(pool.ctx);
 		return NULL;
 	}
 	task->req.answer = answer;
-	task->next_query = next_query;
+	task->next_query = pktbuf;
 
 	/* Start resolution */
 	uv_timer_init(handle->loop, &task->timeout);
@@ -110,21 +127,27 @@ static void qr_task_free(uv_handle_t *handle)
 		uv_ref(task->source.handle);
 		io_start_read(task->source.handle);
 	}
-	mp_delete(task->req.pool.ctx);
+	/* Return mempool to ring or free it if it's full */
+	struct worker_ctx *worker = task->worker;
+	mempool_ring_t *ring = &worker->bufs.ring;
+	if (ring->len < ring->cap) {
+		mp_flush(task->req.pool.ctx);
+		array_push(*ring, task->req.pool);
+	} else {
+		mp_delete(task->req.pool.ctx);
+	}
 }
 
 static void qr_task_timeout(uv_timer_t *req)
 {
 	struct qr_task *task = req->data;
 	if (task->next_handle) {
-		io_stop_read(task->next_handle);
 		qr_task_step(task, NULL);
 	}
 }
 
-static void qr_task_on_send(uv_req_t* req, int status)
+static int qr_task_on_send(struct qr_task *task, int status)
 {
-	struct qr_task *task = req->data;
 	if (task) {
 		/* Start reading answer */
 		if (task->req.overlay.state != KNOT_STATE_NOOP) {
@@ -136,45 +159,39 @@ static void qr_task_on_send(uv_req_t* req, int status)
 			uv_close((uv_handle_t *)&task->timeout, qr_task_free);
 		}
 	}
+	return status;
 }
 
 static int qr_task_send(struct qr_task *task, uv_handle_t *handle, struct sockaddr *addr, knot_pkt_t *pkt)
 {
+	int ret = 0;
 	if (handle->type == UV_UDP) {
 		uv_buf_t buf = { (char *)pkt->wire, pkt->size };
-		uv_udp_send_t *req = &task->ioreq.udp_send;
-		req->data = task;
-		return uv_udp_send(req, (uv_udp_t *)handle, &buf, 1, addr, (uv_udp_send_cb)qr_task_on_send);
+		ret = uv_udp_try_send((uv_udp_t *)handle, &buf, 1, addr);
 	} else {
 		uint16_t pkt_size = htons(pkt->size);
 		uv_buf_t buf[2] = {
 			{ (char *)&pkt_size, sizeof(pkt_size) },
 			{ (char *)pkt->wire, pkt->size }
 		};
-		uv_write_t *req = &task->ioreq.tcp_send;
-		req->data = task;
-		return uv_write(req, (uv_stream_t *)handle, buf, 2, (uv_write_cb)qr_task_on_send);
+		ret = uv_try_write((uv_stream_t *)handle, buf, 2);
 	}
+	return qr_task_on_send(task, (ret >= 0) ? 0 : -1);
 }
 
 static void qr_task_on_connect(uv_connect_t *connect, int status)
 {
-	uv_stream_t *handle = connect->handle;
-	struct qr_task *task = connect->data;
-	if (status != 0) { /* Failed to connect */
-		qr_task_step(task, NULL);
-	} else {
-		qr_task_send(task, (uv_handle_t *)handle, NULL, task->next_query);
+	if (status == 0) {
+		struct qr_task *task = connect->data;
+		qr_task_send(task, (uv_handle_t *)connect->handle, NULL, task->next_query);
 	}
+	free(connect);
 }
 
 static int qr_task_finalize(struct qr_task *task, int state)
 {
 	kr_resolve_finish(&task->req, state);
-	int ret = qr_task_send(task, task->source.handle, (struct sockaddr *)&task->source.addr, task->req.answer);
-	if (ret != 0) { /* Broken connection */
-		uv_close((uv_handle_t *)&task->timeout, qr_task_free);
-	}
+	(void) qr_task_send(task, task->source.handle, (struct sockaddr *)&task->source.addr, task->req.answer);
 	return state == KNOT_STATE_DONE ? 0 : kr_error(EIO);
 }
 
@@ -182,7 +199,10 @@ static int qr_task_step(struct qr_task *task, knot_pkt_t *packet)
 {
 	/* Cancel timeout if active, close handle. */
 	if (task->next_handle) {
-		uv_close(task->next_handle, (uv_close_cb) free);
+		if (!uv_is_closing(task->next_handle)) {
+			io_stop_read(task->next_handle);
+			uv_close(task->next_handle, (uv_close_cb) free);
+		}
 		uv_timer_stop(&task->timeout);
 		task->next_handle = NULL;
 	}
@@ -194,13 +214,14 @@ static int qr_task_step(struct qr_task *task, knot_pkt_t *packet)
 	int state = kr_resolve_consume(&task->req, packet);
 	while (state == KNOT_STATE_PRODUCE) {
 		state = kr_resolve_produce(&task->req, &addr, &sock_type, next_query);
+		if (++task->iter_count > KR_ITER_LIMIT) {
+			return qr_task_finalize(task, KNOT_STATE_FAIL);
+		}
 	}
 
 	/* We're done, no more iterations needed */
 	if (state & (KNOT_STATE_DONE|KNOT_STATE_FAIL)) {
 		return qr_task_finalize(task, state);
-	} else if (++task->iter_count > KR_ITER_LIMIT) {
-		return qr_task_finalize(task, KNOT_STATE_FAIL);
 	}
 
 	/* Create connection for iterative query */
@@ -213,8 +234,11 @@ static int qr_task_step(struct qr_task *task, knot_pkt_t *packet)
 	/* Connect or issue query datagram */
 	task->next_handle->data = task;
 	if (sock_type == SOCK_STREAM) {
-		uv_connect_t *connect = &task->ioreq.connect;
-		if (uv_tcp_connect(connect, (uv_tcp_t *)task->next_handle, addr, qr_task_on_connect) != 0) {
+		/* connect handle must be persistent even if the task mempool drops,
+		 * as it is referenced internally in the libuv event loop */
+		uv_connect_t *connect = malloc(sizeof(*connect));
+		if (!connect || uv_tcp_connect(connect, (uv_tcp_t *)task->next_handle, addr, qr_task_on_connect) != 0) {
+			free(connect);
 			return qr_task_step(task, NULL);
 		}
 		connect->data = task;
@@ -246,7 +270,7 @@ int worker_exec(struct worker_ctx *worker, uv_handle_t *handle, knot_pkt_t *quer
 		if (ret != 0 || knot_wire_get_qr(query->wire)) {
 			return kr_error(EINVAL); /* Ignore. */
 		}
-		task = qr_task_create(worker, handle, addr);
+		task = qr_task_create(worker, handle, query, addr);
 		if (!task) {
 			return kr_error(ENOMEM);
 		}
@@ -254,4 +278,18 @@ int worker_exec(struct worker_ctx *worker, uv_handle_t *handle, knot_pkt_t *quer
 
 	/* Consume input and produce next query */
 	return qr_task_step(task, query);
+}
+
+int worker_reserve(struct worker_ctx *worker, size_t ring_maxlen)
+{
+	return array_reserve(worker->bufs.ring, ring_maxlen);
+}
+
+void worker_reclaim(struct worker_ctx *worker)
+{
+	mempool_ring_t *ring = &worker->bufs.ring;
+	for (unsigned i = 0; i < ring->len; ++i) {
+		mp_delete(ring->at[i].ctx);
+	}
+	array_clear(*ring);
 }

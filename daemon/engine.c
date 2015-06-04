@@ -14,6 +14,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <ccan/json/json.h>
 #include <uv.h>
 #include <unistd.h>
 #include <libknot/internal/mempattern.h>
@@ -23,8 +24,14 @@
 #include "daemon/engine.h"
 #include "daemon/bindings.h"
 #include "daemon/ffimodule.h"
+#include "lib/nsrep.h"
 #include "lib/cache.h"
 #include "lib/defines.h"
+
+/** @internal Compatibility wrapper for Lua < 5.2 */
+#if LUA_VERSION_NUM < 502
+#define lua_rawlen(L, obj) lua_objlen((L), (obj))
+#endif
 
 /*
  * Global bindings.
@@ -68,6 +75,29 @@ static int l_hostname(lua_State *L)
 	return 1;
 }
 
+/** Unpack JSON object to table */
+static void l_unpack_json(lua_State *L, JsonNode *table)
+{
+	lua_newtable(L);
+	JsonNode *node = NULL;
+	json_foreach(node, table) {
+		/* Push node value */
+		switch(node->tag) {
+		case JSON_OBJECT: /* as array */
+		case JSON_ARRAY:  l_unpack_json(L, node); break;
+		case JSON_STRING: lua_pushstring(L, node->string_); break;
+		case JSON_NUMBER: lua_pushnumber(L, node->number_); break;
+		default: continue;
+		}
+		/* Set table key */
+		if (node->key) {
+			lua_setfield(L, -2, node->key);
+		} else {
+			lua_rawseti(L, -2, lua_rawlen(L, -2) + 1);
+		}
+	}
+}
+
 /** Trampoline function for module properties. */
 static int l_trampoline(lua_State *L)
 {
@@ -82,13 +112,25 @@ static int l_trampoline(lua_State *L)
 	/* Now we only have property callback or config,
 	 * if we expand the callables, we might need a callback_type.
 	 */
+	const char *args = NULL;
+	if (lua_gettop(L) > 0) {
+		args = lua_tostring(L, 1);
+	}
 	if (callback == module->config) {
-		const char *param = lua_tostring(L, 1);
-		module->config(module, param);
+		module->config(module, args);
 	} else {
 		kr_prop_cb *prop = (kr_prop_cb *)callback;
-		auto_free char *ret = prop(engine, module, lua_tostring(L, 1));
-		lua_pushstring(L, ret);
+		auto_free char *ret = prop(engine, module, args);
+		if (!ret) { /* No results */
+			return 0;
+		}
+		JsonNode *root_node = json_decode(ret);
+		if (root_node->tag == JSON_OBJECT || root_node->tag == JSON_ARRAY) {
+			l_unpack_json(L, root_node);
+		} else {
+			lua_pushstring(L, ret);
+		}
+		json_delete(root_node);
 		return 1;
 	}
 
@@ -116,6 +158,11 @@ static int init_resolver(struct engine *engine)
 {
 	/* Open resolution context */
 	engine->resolver.modules = &engine->modules;
+	/* Open NS reputation cache */
+	engine->resolver.nsrep = malloc(lru_size(kr_nsrep_lru_t, DEFAULT_NSREP_SIZE));
+	if (engine->resolver.nsrep) {
+		lru_init(engine->resolver.nsrep, DEFAULT_NSREP_SIZE);
+	}
 
 	/* Load basic modules */
 	engine_register(engine, "iterate");
@@ -176,6 +223,19 @@ int engine_init(struct engine *engine, mm_ctx_t *pool)
 	return ret;
 }
 
+static void engine_unload(struct engine *engine, struct kr_module *module)
+{
+	/* Unregister module */
+	auto_free char *name = strdup(module->name);
+	kr_module_unload(module);
+	/* Clear in Lua world */
+	if (name) {
+		lua_pushnil(engine->L);
+		lua_setglobal(engine->L, name);
+	}
+	free(module);
+}
+
 void engine_deinit(struct engine *engine)
 {
 	if (engine == NULL) {
@@ -183,10 +243,12 @@ void engine_deinit(struct engine *engine)
 	}
 
 	network_deinit(&engine->net);
+	kr_cache_close(&engine->resolver.cache);
+	lru_deinit(engine->resolver.nsrep);
 
 	/* Unload modules. */
 	for (size_t i = 0; i < engine->modules.len; ++i) {
-		kr_module_unload(&engine->modules.at[i]);
+		engine_unload(engine, engine->modules.at[i]);
 	}
 	array_clear(engine->modules);
 	array_clear(engine->storage_registry);
@@ -195,7 +257,6 @@ void engine_deinit(struct engine *engine)
 		lua_close(engine->L);
 	}
 
-	kr_cache_close(engine->resolver.cache);
 }
 
 int engine_pcall(lua_State *L, int argc)
@@ -317,18 +378,24 @@ int engine_register(struct engine *engine, const char *name)
 	/* Make sure module is unloaded */
 	(void) engine_unregister(engine, name);
 	/* Attempt to load binary module */
-	size_t next = engine->modules.len;
-	array_reserve(engine->modules, next + 1);
-	struct kr_module *module = &engine->modules.at[next];
+	struct kr_module *module = malloc(sizeof(*module));
+	if (!module) {
+		return kr_error(ENOMEM);
+	}
+	module->data = engine;
 	int ret = kr_module_load(module, name, NULL);
 	/* Load Lua module if not a binary */
 	if (ret == kr_error(ENOENT)) {
 		ret = ffimodule_register_lua(engine, module, name);
 	}
 	if (ret != 0) {
+		free(module);
 		return ret;
-	} else {
-		engine->modules.len += 1;
+	}
+
+	if (array_push(engine->modules, module) < 0) {
+		engine_unload(engine, module);
+		return kr_error(ENOMEM);
 	}
 
 	/* Register properties */
@@ -345,18 +412,15 @@ int engine_unregister(struct engine *engine, const char *name)
 	module_array_t *mod_list = &engine->modules;
 	size_t found = mod_list->len;
 	for (size_t i = 0; i < mod_list->len; ++i) {
-		if (strcmp(mod_list->at[i].name, name) == 0) {
+		struct kr_module *mod = mod_list->at[i];
+		if (strcmp(mod->name, name) == 0) {
 			found = i;
 			break;
 		}
 	}
-
-	/* Unregister module */
 	if (found < mod_list->len) {
-		kr_module_unload(&mod_list->at[found]);
+		engine_unload(engine, mod_list->at[found]);
 		array_del(*mod_list, found);
-		lua_pushnil(engine->L);
-		lua_setglobal(engine->L, name);
 		return kr_ok();
 	}
 

@@ -150,8 +150,10 @@ int kr_module_load(struct kr_module *module, const char *name, const char *path)
 		return kr_error(EINVAL);
 	}
 
-	/* Initialize. */
+	/* Initialize, keep userdata */
+	void *data = module->data;
 	memset(module, 0, sizeof(struct kr_module));
+	module->data = data;
 	module->name = strdup(name);
 	if (module->name == NULL) {
 		return kr_error(ENOMEM);
@@ -191,8 +193,6 @@ void kr_module_unload(struct kr_module *module)
 		return;
 	}
 
-	free(module->name);
-
 	if (module->deinit) {
 		module->deinit(module);
 	}
@@ -201,5 +201,6 @@ void kr_module_unload(struct kr_module *module)
 		dlclose(module->lib);
 	}
 
+	free(module->name);
 	memset(module, 0, sizeof(struct kr_module));
 }

@@ -15,7 +15,7 @@
  */
 
 #include <stdio.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 
 #include <libknot/internal/mempool.h>
 #include <libknot/rrtype/rdname.h>
@@ -28,38 +28,84 @@
 
 #define DEBUG_MSG(fmt...) QRDEBUG(kr_rplan_current(rplan), "resl",  fmt)
 
+/** @internal Subtract time (best effort) */
+float time_diff(struct timeval *begin, struct timeval *end)
+{
+	return (end->tv_sec - begin->tv_sec) * 1000 +
+	       (end->tv_usec - begin->tv_usec) / 1000.0;
+
+}
+
 /** Invalidate current NS/addr pair. */
 static int invalidate_ns(struct kr_rplan *rplan, struct kr_query *qry)
 {
-	uint8_t *addr = kr_nsrep_inaddr(qry->ns.addr);
-	size_t addr_len = kr_nsrep_inaddr_len(qry->ns.addr);
-	knot_rdata_t rdata[knot_rdata_array_size(addr_len)];
-	knot_rdata_init(rdata, addr_len, addr, 0);
-	return kr_zonecut_del(&qry->zone_cut, qry->ns.name, rdata);
+	if (qry->ns.addr.ip.sa_family != AF_UNSPEC) {
+		uint8_t *addr = kr_nsrep_inaddr(qry->ns.addr);
+		size_t addr_len = kr_nsrep_inaddr_len(qry->ns.addr);
+		knot_rdata_t rdata[knot_rdata_array_size(addr_len)];
+		knot_rdata_init(rdata, addr_len, addr, 0);
+		return kr_zonecut_del(&qry->zone_cut, qry->ns.name, rdata);
+	} else {
+		return kr_zonecut_del(&qry->zone_cut, qry->ns.name, NULL);
+	}
+}
+
+static void ns_fetch_cut(struct kr_query *qry, struct kr_request *req)
+{
+	struct kr_cache_txn txn;
+	if (kr_cache_txn_begin(&req->ctx->cache, &txn, NAMEDB_RDONLY) != 0) {
+		kr_zonecut_set_sbelt(&qry->zone_cut);
+	} else {
+		/* If at/subdomain of parent zone cut, start from 'one up' to avoid loops */
+		struct kr_query *parent = qry->parent;
+		const knot_dname_t *start_from = qry->sname;
+		if (parent && knot_dname_in(parent->zone_cut.name, qry->sname)) {
+			start_from = parent->zone_cut.name;
+		}
+		/* Find closest zone cut from cache */
+		kr_zonecut_find_cached(&qry->zone_cut, start_from, &txn, qry->timestamp.tv_sec);
+		kr_cache_txn_abort(&txn);
+	}
 }
 
 static int ns_resolve_addr(struct kr_query *qry, struct kr_request *param)
 {
 	struct kr_rplan *rplan = &param->rplan;
-	if (kr_rplan_satisfies(qry, qry->ns.name, KNOT_CLASS_IN, KNOT_RRTYPE_A) ||
-	    kr_rplan_satisfies(qry, qry->ns.name, KNOT_CLASS_IN, KNOT_RRTYPE_AAAA) ||
-	    qry->flags & QUERY_AWAIT_ADDR) {
+
+	/* Start NS queries from root, to avoid certain cases
+	 * where a NS drops out of cache and the rest is unavailable,
+	 * this would lead to dependency loop in current zone cut.
+	 * Prefer IPv6 and continue with IPv4 if not available.
+	 */
+	uint16_t next_type = 0;
+	if (!(qry->flags & QUERY_AWAIT_IPV6)) {
+		next_type = KNOT_RRTYPE_AAAA;
+		qry->flags |= QUERY_AWAIT_IPV6;
+	} else if (!(qry->flags & QUERY_AWAIT_IPV4)) {
+		next_type = KNOT_RRTYPE_A;
+		qry->flags |= QUERY_AWAIT_IPV4;
+	}
+	/* Bail out if the query is already pending or dependency loop. */
+	if (!next_type || kr_rplan_satisfies(qry->parent, qry->ns.name, KNOT_CLASS_IN, next_type)) {
 		DEBUG_MSG("=> dependency loop, bailing out\n");
-		kr_rplan_pop(rplan, qry);
-		return KNOT_STATE_PRODUCE;
+		invalidate_ns(rplan, qry);
+		return kr_error(EHOSTUNREACH);
+	}
+	/* Push new query to the resolution plan */
+	struct kr_query *next = kr_rplan_push(rplan, qry, qry->ns.name, KNOT_CLASS_IN, next_type);
+	if (!next) {
+		return kr_error(ENOMEM);
 	}
 
-	(void) kr_rplan_push(rplan, qry, qry->ns.name, KNOT_CLASS_IN, KNOT_RRTYPE_AAAA);
-	(void) kr_rplan_push(rplan, qry, qry->ns.name, KNOT_CLASS_IN, KNOT_RRTYPE_A);
-	qry->flags |= QUERY_AWAIT_ADDR;
-	return KNOT_STATE_PRODUCE;
+	next->flags |= QUERY_AWAIT_CUT;
+	return kr_ok();
 }
 
 static void prepare_layers(struct kr_request *param)
 {
 	struct kr_context *ctx = param->ctx;
 	for (size_t i = 0; i < ctx->modules->len; ++i) {
-		struct kr_module *mod = &ctx->modules->at[i];
+		struct kr_module *mod = ctx->modules->at[i];
 		if (mod->layer) {
 			knot_overlay_add(&param->overlay, mod->layer(mod), param);
 		}
@@ -279,6 +325,9 @@ int kr_resolve_query(struct kr_request *request, const knot_dname_t *qname, uint
 		return KNOT_STATE_FAIL;
 	}
 
+	/* Deferred zone cut lookup for this query. */
+	qry->flags |= QUERY_AWAIT_CUT;
+
 	/* Initialize answer packet */
 	knot_pkt_t *answer = request->answer;
 	knot_wire_set_qr(answer->wire);
@@ -316,6 +365,8 @@ int kr_resolve_consume(struct kr_request *request, knot_pkt_t *packet)
 			DEBUG_MSG("=> ns unreachable, retrying over TCP\n");
 			qry->flags |= QUERY_TCP;
 			return KNOT_STATE_CONSUME; /* Try again */
+		} else {
+			kr_nsrep_update(&qry->ns, KR_NS_TIMEOUT, qry->ns.repcache);
 		}
 	} else {
 		state = knot_overlay_consume(&request->overlay, packet);
@@ -327,11 +378,18 @@ int kr_resolve_consume(struct kr_request *request, knot_pkt_t *packet)
 		if (invalidate_ns(rplan, qry) == 0) {
 			qry->flags &= ~QUERY_TCP;
 		}
+	/* Track RTT for iterative answers */
+	} else if (!(qry->flags & QUERY_CACHED)) {
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		kr_nsrep_update(&qry->ns, time_diff(&qry->timestamp, &now), qry->ns.repcache);
 	}
 
 	/* Pop query if resolved. */
 	if (qry->flags & QUERY_RESOLVED) {
 		kr_rplan_pop(rplan, qry);
+	} else { /* Clear query flags for next attempt */
+		qry->flags &= ~QUERY_CACHED;
 	}
 
 	knot_overlay_reset(&request->overlay);
@@ -349,6 +407,7 @@ int kr_resolve_produce(struct kr_request *request, struct sockaddr **dst, int *t
 	}
 
 #ifndef NDEBUG
+	unsigned ns_election_iter = 0;
 	char name_str[KNOT_DNAME_MAXLEN], type_str[16];
 	knot_dname_to_str(name_str, qry->sname, sizeof(name_str));
 	knot_rrtype_to_string(qry->stype, type_str, sizeof(type_str));
@@ -374,21 +433,39 @@ int kr_resolve_produce(struct kr_request *request, struct sockaddr **dst, int *t
 		return kr_rplan_empty(rplan) ? KNOT_STATE_DONE : KNOT_STATE_PRODUCE;
 	}
 
+	/* The query wasn't resolved from cache,
+	 * now it's the time to look up closest zone cut from cache.
+	 */
+	if (qry->flags & QUERY_AWAIT_CUT) {
+		ns_fetch_cut(qry, request);
+		qry->flags &= ~QUERY_AWAIT_CUT;
+	}
+
+ns_election:
 	/* Elect best nameserver candidate */
-	kr_nsrep_elect(&qry->ns, &qry->zone_cut.nsset);
-	if (qry->ns.score < KR_NS_VALID) {
+	assert(++ns_election_iter < KR_ITER_LIMIT);
+	/* Set slow NS throttling mode */
+	qry->ns.flags = 0;
+	if (qry->flags & QUERY_NO_THROTTLE) {
+		qry->ns.flags = QUERY_NO_THROTTLE;
+	}
+	kr_nsrep_elect(&qry->ns, &qry->zone_cut.nsset, request->ctx->nsrep);
+	if (qry->ns.score > KR_NS_MAX_SCORE) {
 		DEBUG_MSG("=> no valid NS left\n");
 		knot_overlay_reset(&request->overlay);
 		kr_rplan_pop(rplan, qry);
 		return KNOT_STATE_PRODUCE;
 	} else {
 		if (qry->ns.addr.ip.sa_family == AF_UNSPEC) {
-			DEBUG_MSG("=> ns missing A/AAAA, fetching\n");
+			if (ns_resolve_addr(qry, request) != 0) {
+				qry->flags &= ~(QUERY_AWAIT_IPV6|QUERY_AWAIT_IPV4);
+				goto ns_election; /* Must try different NS */
+			}
 			knot_overlay_reset(&request->overlay);
-			return ns_resolve_addr(qry, request);
+			return KNOT_STATE_PRODUCE;
 		} else {
 			/* Address resolved, clear the flag */
-			qry->flags &= ~QUERY_AWAIT_ADDR;
+			qry->flags &= ~(QUERY_AWAIT_IPV6|QUERY_AWAIT_IPV4);
 		}
 	}
 
@@ -398,7 +475,7 @@ int kr_resolve_produce(struct kr_request *request, struct sockaddr **dst, int *t
 	struct sockaddr *addr = &qry->ns.addr.ip;
 	inet_ntop(addr->sa_family, kr_nsrep_inaddr(qry->ns.addr), ns_str, sizeof(ns_str));
 	knot_dname_to_str(zonecut_str, qry->zone_cut.name, sizeof(zonecut_str));
-	DEBUG_MSG("=> querying: '%s' zone cut: '%s' m12n: '%s'\n", ns_str, zonecut_str, qname_str);
+	DEBUG_MSG("=> querying: '%s' score: %u zone cut: '%s' m12n: '%s'\n", ns_str, qry->ns.score, zonecut_str, qname_str);
 #endif
 
 	/* Prepare additional query */
@@ -406,6 +483,7 @@ int kr_resolve_produce(struct kr_request *request, struct sockaddr **dst, int *t
 	if (ret != 0) {
 		return KNOT_STATE_FAIL;
 	}
+	gettimeofday(&qry->timestamp, NULL);
 	*dst = &qry->ns.addr.ip;
 	*type = (qry->flags & QUERY_TCP) ? SOCK_STREAM : SOCK_DGRAM;
 	return state;
@@ -422,13 +500,13 @@ int kr_resolve_finish(struct kr_request *request, int state)
 		state = KNOT_STATE_FAIL;
 	}
 	/* Error during procesing, internal failure */
-	knot_overlay_finish(&request->overlay);
 	if (state != KNOT_STATE_DONE) {
 		knot_pkt_t *answer = request->answer;
 		if (knot_wire_get_rcode(answer->wire) == KNOT_RCODE_NOERROR) {
 			knot_wire_set_rcode(answer->wire, KNOT_RCODE_SERVFAIL);
 		}
 	}
+	knot_overlay_finish(&request->overlay);
 	/* Clean up. */
 	knot_overlay_deinit(&request->overlay);
 	request->overlay.state = KNOT_STATE_NOOP;

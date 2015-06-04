@@ -1,7 +1,7 @@
 -- Units
 kB = 1024
-MB = 1024*1024
-GB = 1024*1024
+MB = 1024*kB
+GB = 1024*MB
 -- Time
 sec = 1000
 minute = 60 * sec
@@ -52,8 +52,8 @@ setmetatable(modules, {
 -- `cache.{size|storage} = value`
 setmetatable(cache, {
 	__newindex = function (t,k,v)
-		if     k == 'size'    then t.open(v, rawget(t, 'storage'))
-		elseif k == 'storage' then t.open(rawget(t, 'size'), v)
+		if     k == 'size'    then t.open(v, rawget(t, 'current_storage'))
+		elseif k == 'storage' then t.open(rawget(t, 'current_size'), v)
 		else   rawset(t, k, v) end
 	end
 })

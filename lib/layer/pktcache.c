@@ -23,6 +23,8 @@
 #include "lib/module.h"
 
 #define DEBUG_MSG(fmt...) QRDEBUG(kr_rplan_current(rplan), " pc ",  fmt)
+#define DEFAULT_MAXTTL (15 * 60)
+#define DEFAULT_NOTTL (5) /* Short-time "no data" retention to avoid bursts */
 
 static inline uint8_t get_tag(knot_pkt_t *pkt)
 {
@@ -35,10 +37,27 @@ static int begin(knot_layer_t *ctx, void *module_param)
 	return ctx->state;
 }
 
-static int loot_cache(namedb_txn_t *txn, knot_pkt_t *pkt, uint8_t tag, uint32_t timestamp)
+static uint32_t limit_ttl(uint32_t ttl)
 {
-	const knot_dname_t *qname = knot_pkt_qname(pkt);
-	uint16_t rrtype = knot_pkt_qtype(pkt);
+	/* @todo Configurable limit */
+	return (ttl > DEFAULT_MAXTTL) ? DEFAULT_MAXTTL : ttl;
+}
+
+static void adjust_ttl(knot_rrset_t *rr, uint32_t drift)
+{
+	knot_rdata_t *rd = knot_rdataset_at(&rr->rrs, 0);
+	for (uint16_t i = 0; i < rr->rrs.rr_count; ++i) {
+		uint32_t ttl = knot_rdata_ttl(rd);
+		if (ttl >= drift) {
+			knot_rdata_set_ttl(rd, ttl - drift);
+		}
+		rd += knot_rdata_array_size(knot_rdata_rdlen(rd));
+	}
+}
+
+static int loot_cache_pkt(struct kr_cache_txn *txn, knot_pkt_t *pkt, const knot_dname_t *qname,
+                          uint16_t rrtype, uint8_t tag, uint32_t timestamp)
+{
 	struct kr_cache_entry *entry;
 	entry = kr_cache_peek(txn, tag, qname, rrtype, &timestamp);
 	if (!entry) { /* Not in the cache */
@@ -50,14 +69,35 @@ static int loot_cache(namedb_txn_t *txn, knot_pkt_t *pkt, uint8_t tag, uint32_t 
 		/* Keep original header and copy cached */
 		uint8_t header[KNOT_WIRE_HEADER_SIZE];
 		memcpy(header, pkt->wire, sizeof(header));
+		/* Copy and reparse */
+		knot_pkt_clear(pkt);
 		memcpy(pkt->wire, entry->data, entry->count);
 		pkt->size = entry->count;
-		pkt->parsed = 0;
-		pkt->reserved = 0;
+		knot_pkt_parse(pkt, 0);
 		/* Restore header bits */
 		knot_wire_set_id(pkt->wire, knot_wire_get_id(header));
 	}
-	return kr_ok();
+
+	/* Adjust TTL in records. */
+	int ret = 0;
+	for (knot_section_t i = KNOT_ANSWER; i <= KNOT_ADDITIONAL; ++i) {
+		const knot_pktsection_t *sec = knot_pkt_section(pkt, i);
+		for (unsigned k = 0; k < sec->count; ++k) {
+			const knot_rrset_t *rr = knot_pkt_rr(sec, k);
+			adjust_ttl((knot_rrset_t *)rr, timestamp);
+		}
+	}
+
+	return ret;
+}
+
+/** @internal Try to find a shortcut directly to searched packet. */
+static int loot_cache(struct kr_cache_txn *txn, knot_pkt_t *pkt, uint8_t tag, struct kr_query *qry)
+{
+	uint32_t timestamp = qry->timestamp.tv_sec;
+	const knot_dname_t *qname = qry->sname;
+	uint16_t rrtype = qry->stype;
+	return loot_cache_pkt(txn, pkt, qname, rrtype, tag, timestamp);
 }
 
 static int peek(knot_layer_t *ctx, knot_pkt_t *pkt)
@@ -68,54 +108,79 @@ static int peek(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (!qry || ctx->state & (KNOT_STATE_DONE|KNOT_STATE_FAIL)) {
 		return ctx->state;
 	}
+	if (knot_pkt_qclass(pkt) != KNOT_CLASS_IN) {
+		return ctx->state; /* Only IN class */
+	}
 
-	/* Fetch packet from cache */
-	namedb_txn_t txn;
-	struct kr_cache *cache = req->ctx->cache;
+	/* Prepare read transaction */
+	struct kr_cache_txn txn;
+	struct kr_cache *cache = &req->ctx->cache;
 	if (kr_cache_txn_begin(cache, &txn, NAMEDB_RDONLY) != 0) {
 		return ctx->state;
 	}
-	uint32_t timestamp = qry->timestamp.tv_sec;
-	if (loot_cache(&txn, pkt, get_tag(req->answer), timestamp) != 0) {
-		kr_cache_txn_abort(&txn);
-		return ctx->state;
-	}
 
-	/* Mark as solved from cache */
-	DEBUG_MSG("=> satisfied from cache\n");
-	qry->flags |= QUERY_CACHED;
-	knot_wire_set_qr(pkt->wire);
+	/* Fetch either answer to original or minimized query */
+	uint8_t tag = get_tag(req->answer);
+	int ret = loot_cache(&txn, pkt, tag, qry);
 	kr_cache_txn_abort(&txn);
-	return KNOT_STATE_DONE;
+	if (ret == 0) {
+		DEBUG_MSG("=> satisfied from cache\n");
+		qry->flags |= QUERY_CACHED|QUERY_NO_MINIMIZE;
+		pkt->parsed = pkt->size;
+		knot_wire_set_qr(pkt->wire);
+		knot_wire_set_aa(pkt->wire);
+		return KNOT_STATE_DONE;
+	}
+	return ctx->state;
 }
 
 static uint32_t packet_ttl(knot_pkt_t *pkt)
 {
-	uint32_t ttl = 0;
-	/* Fetch SOA from authority. */
-	const knot_pktsection_t *ns = knot_pkt_section(pkt, KNOT_AUTHORITY);
-	for (unsigned i = 0; i < ns->count; ++i) {
-		const knot_rrset_t *rr = knot_pkt_rr(ns, i);
-		if (rr->type == KNOT_RRTYPE_SOA) {
-			ttl = knot_soa_minimum(&rr->rrs);
-			break;
+	bool has_ttl = false;
+	uint32_t ttl = UINT32_MAX;
+	/* Get minimum entry TTL in the packet */
+	for (knot_section_t i = KNOT_ANSWER; i <= KNOT_ADDITIONAL; ++i) {
+		const knot_pktsection_t *sec = knot_pkt_section(pkt, i);
+		for (unsigned k = 0; k < sec->count; ++k) {
+			const knot_rrset_t *rr = knot_pkt_rr(sec, k);
+			/* Skip OPT and TSIG */
+			if (rr->type == KNOT_RRTYPE_OPT || rr->type == KNOT_RRTYPE_TSIG) {
+				continue;
+			}
+			knot_rdata_t *rd = knot_rdataset_at(&rr->rrs, 0);
+			for (uint16_t j = 0; j < rr->rrs.rr_count; ++j) {
+				if (knot_rdata_ttl(rd) < ttl) {
+					ttl = knot_rdata_ttl(rd);
+					has_ttl = true;
+				}
+				rd += knot_rdata_array_size(knot_rdata_rdlen(rd));
+			}
 		}
 	}
-	/* @todo Fetch TTL from NSEC* proof */
-	return ttl;
+	/* Get default if no valid TTL present */
+	if (!has_ttl) {
+		ttl = DEFAULT_NOTTL;
+	}
+	return limit_ttl(ttl);
 }
 
-static int stash(knot_layer_t *ctx)
+static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 {
 	struct kr_request *req = ctx->data;
 	struct kr_rplan *rplan = &req->rplan;
-	if (EMPTY_LIST(rplan->resolved) || ctx->state == KNOT_STATE_FAIL) {
+	struct kr_query *qry = kr_rplan_current(rplan);
+	/* Cache only answers that make query resolved (i.e. authoritative)
+	 * that didn't fail during processing and are negative. */
+	if (!(qry->flags & QUERY_RESOLVED) || qry->flags & QUERY_CACHED || ctx->state & KNOT_STATE_FAIL) {
 		return ctx->state; /* Don't cache anything if failed. */
 	}
-	knot_pkt_t *pkt = req->answer;
-	struct kr_query *qry = TAIL(rplan->resolved);
-	if (qry->flags & QUERY_CACHED || kr_response_classify(pkt) == PKT_NOERROR) {
+	bool is_auth = knot_wire_get_aa(pkt->wire);
+	int pkt_class = kr_response_classify(pkt);
+	if (!(pkt_class & (PKT_NODATA|PKT_REFUSED|PKT_NXDOMAIN)) && is_auth) {
 		return ctx->state; /* Cache only negative, not-cached answers. */
+	}
+	if (knot_pkt_qclass(pkt) != KNOT_CLASS_IN) {
+		return ctx->state; /* Only IN class */
 	}
 	uint32_t ttl = packet_ttl(pkt);
 	if (ttl == 0) {
@@ -123,8 +188,8 @@ static int stash(knot_layer_t *ctx)
 	}
 
 	/* Open write transaction and prepare answer */
-	namedb_txn_t txn;
-	if (kr_cache_txn_begin(req->ctx->cache, &txn, 0) != 0) {
+	struct kr_cache_txn txn;
+	if (kr_cache_txn_begin(&req->ctx->cache, &txn, 0) != 0) {
 		return ctx->state; /* Couldn't acquire cache, ignore. */
 	}
 	const knot_dname_t *qname = knot_pkt_qname(pkt);
@@ -153,7 +218,7 @@ const knot_layer_api_t *pktcache_layer(struct kr_module *module)
 	static const knot_layer_api_t _layer = {
 		.begin   = &begin,
 		.produce = &peek,
-		.finish  = &stash
+		.consume  = &stash
 	};
 
 	return &_layer;

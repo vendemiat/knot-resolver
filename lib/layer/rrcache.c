@@ -32,37 +32,56 @@ static int begin(knot_layer_t *ctx, void *module_param)
 	return ctx->state;
 }
 
-static int loot_rr(namedb_txn_t *txn, knot_pkt_t *pkt, const knot_dname_t *name,
-                   uint16_t rrtype, uint16_t rrclass, uint32_t timestamp)
+static int loot_rr(struct kr_cache_txn *txn, knot_pkt_t *pkt, const knot_dname_t *name,
+                  uint16_t rrclass, uint16_t rrtype, struct kr_query *qry)
 {
+	/* Check if record exists in cache */
+	uint32_t timestamp = qry->timestamp.tv_sec;
 	knot_rrset_t cache_rr;
 	knot_rrset_init(&cache_rr, (knot_dname_t *)name, rrtype, rrclass);
 	int ret = kr_cache_peek_rr(txn, &cache_rr, &timestamp);
 	if (ret != 0) {
 		return ret;
 	}
-	knot_rrset_t rr_copy = kr_cache_materialize(&cache_rr, timestamp, &pkt->mm);
-	if (rr_copy.rrs.rr_count == 0) {
-		return kr_error(ENOENT);
-	}
-	ret = knot_pkt_put(pkt, KNOT_COMPR_HINT_NONE, &rr_copy, KNOT_PF_FREE);
-	if (ret != 0) {
-		knot_rrset_clear(&rr_copy, &pkt->mm);
-		return ret;
-	}
-	return kr_ok();
-}
 
-static int loot_cache(namedb_txn_t *txn, knot_pkt_t *pkt, uint32_t timestamp)
-{
-	const knot_dname_t *qname = knot_pkt_qname(pkt);
-	uint16_t rrclass = knot_pkt_qclass(pkt);
-	uint16_t rrtype = knot_pkt_qtype(pkt);
-	int ret = loot_rr(txn, pkt, qname, rrtype, rrclass, timestamp);
-	if (ret == kr_error(ENOENT) && rrtype != KNOT_RRTYPE_CNAME) { /* Chase CNAME if no direct hit */
-		ret = loot_rr(txn, pkt, qname, KNOT_RRTYPE_CNAME, rrclass, timestamp);
+	/* Update packet question */
+	if (!knot_dname_is_equal(knot_pkt_qname(pkt), name)) {
+		uint8_t header[KNOT_WIRE_HEADER_SIZE];
+		memcpy(header, pkt->wire, sizeof(header));
+		knot_pkt_clear(pkt);
+		memcpy(pkt->wire, header, sizeof(header));
+		knot_pkt_put_question(pkt, qry->sname, qry->sclass, qry->stype);
+	}
+
+	/* Update packet answer */
+	knot_rrset_t rr_copy;
+	ret = kr_cache_materialize(&rr_copy, &cache_rr, timestamp, &pkt->mm);
+	if (ret == 0) {
+		ret = knot_pkt_put(pkt, KNOT_COMPR_HINT_QNAME, &rr_copy, KNOT_PF_FREE);
+		if (ret != 0) {
+			knot_rrset_clear(&rr_copy, &pkt->mm);
+		}
 	}
 	return ret;
+}
+
+static int loot_cache_set(struct kr_cache_txn *txn, knot_pkt_t *pkt, const knot_dname_t *qname,
+                          uint16_t rrclass, uint16_t rrtype, struct kr_query *qry)
+{
+	int ret = loot_rr(txn, pkt, qname, rrclass, rrtype, qry);
+	if (ret == kr_error(ENOENT) && rrtype != KNOT_RRTYPE_CNAME) { /* Chase CNAME if no direct hit */
+		ret = loot_rr(txn, pkt, qname, rrclass, KNOT_RRTYPE_CNAME, qry);
+	}
+	return ret;
+}
+
+/** @internal Try to find a shortcut directly to searched record. */
+static int loot_cache(struct kr_cache_txn *txn, knot_pkt_t *pkt, struct kr_query *qry)
+{
+	const knot_dname_t *qname = qry->sname;
+	uint16_t rrclass = qry->sclass;
+	uint16_t rrtype = qry->stype;
+	return loot_cache_set(txn, pkt, qname, rrclass, rrtype, qry);
 }
 
 static int peek(knot_layer_t *ctx, knot_pkt_t *pkt)
@@ -74,23 +93,24 @@ static int peek(knot_layer_t *ctx, knot_pkt_t *pkt)
 		return ctx->state;
 	}
 
-	namedb_txn_t txn;
-	struct kr_cache *cache = req->ctx->cache;
+	struct kr_cache_txn txn;
+	struct kr_cache *cache = &req->ctx->cache;
 	if (kr_cache_txn_begin(cache, &txn, NAMEDB_RDONLY) != 0) {
-		return KNOT_STATE_CONSUME;
+		return ctx->state;
 	}
 
 	/* Reconstruct the answer from the cache,
 	 * it may either be a CNAME chain or direct answer.
 	 * Only one step of the chain is resolved at a time.
 	 */
-	uint32_t timestamp = qry->timestamp.tv_sec;
-	int ret = loot_cache(&txn, pkt, timestamp);
+	int ret = loot_cache(&txn, pkt, qry);
 	kr_cache_txn_abort(&txn);
 	if (ret == 0) {
 		DEBUG_MSG("=> satisfied from cache\n");
-		qry->flags |= QUERY_CACHED;
+		qry->flags |= QUERY_CACHED|QUERY_NO_MINIMIZE;
+		pkt->parsed = pkt->size;
 		knot_wire_set_qr(pkt->wire);
+		knot_wire_set_aa(pkt->wire);
 		return KNOT_STATE_DONE;
 	}
 	return ctx->state;
@@ -101,6 +121,9 @@ static int merge_cache_rr(knot_rrset_t *cache_rr, const knot_rrset_t *rr, mm_ctx
 {
 	if (rr->type != cache_rr->type || !knot_dname_is_equal(rr->owner, cache_rr->owner)) {
 		return KNOT_EOK; /* Ignore */
+	}
+	if (knot_rrset_ttl(rr) < KR_TTL_GRACE) {
+		return KNOT_EINVAL; /* Cache busters */
 	}
 
 	return knot_rdataset_merge(&cache_rr->rrs, &rr->rrs, pool);
@@ -124,7 +147,7 @@ static int merge_in_section(knot_rrset_t *cache_rr, const knot_pktsection_t *sec
 }
 
 /** Cache direct answer. */
-static int write_cache_rr(const knot_pktsection_t *section, knot_rrset_t *rr, namedb_txn_t *txn, mm_ctx_t *pool, uint32_t timestamp)
+static int write_cache_rr(const knot_pktsection_t *section, knot_rrset_t *rr, struct kr_cache_txn *txn, mm_ctx_t *pool, uint32_t timestamp)
 {
 	/* Check if already cached. */
 	knot_rrset_t query_rr;
@@ -146,7 +169,10 @@ static int write_cache_rr(const knot_pktsection_t *section, knot_rrset_t *rr, na
 		/* Follow the chain */
 		rr->owner = (knot_dname_t *)knot_ns_name(&rr->rrs, 0);
 		knot_rdataset_clear(&rr->rrs, pool);
-
+		/* Check if target already cached. */
+		if (kr_cache_peek_rr(txn, rr, &timestamp) == KNOT_EOK) {
+			break;
+		}
 	}
 
 	/* Now there may be a terminal record. */
@@ -161,7 +187,7 @@ static int write_cache_rr(const knot_pktsection_t *section, knot_rrset_t *rr, na
 }
 
 /** Cache direct answer. */
-static int write_cache_answer(knot_pkt_t *pkt, namedb_txn_t *txn, mm_ctx_t *pool, uint32_t timestamp)
+static int write_cache_answer(knot_pkt_t *pkt, struct kr_cache_txn *txn, mm_ctx_t *pool, uint32_t timestamp)
 {
 	knot_rrset_t cache_rr;
 	knot_rrset_init(&cache_rr, (knot_dname_t *)knot_pkt_qname(pkt), knot_pkt_qtype(pkt), knot_pkt_qclass(pkt));
@@ -171,7 +197,7 @@ static int write_cache_answer(knot_pkt_t *pkt, namedb_txn_t *txn, mm_ctx_t *pool
 }
 
 /** Cache stub nameservers. */
-static int write_cache_authority(knot_pkt_t *pkt, namedb_txn_t *txn, mm_ctx_t *pool, uint32_t timestamp)
+static int write_cache_authority(struct kr_zonecut *cut, knot_pkt_t *pkt, struct kr_cache_txn *txn, mm_ctx_t *pool, uint32_t timestamp)
 {
 	knot_rrset_t glue_rr = { NULL, 0, 0 };
 	knot_rrset_t cache_rr = { NULL, 0, 0 };
@@ -183,6 +209,10 @@ static int write_cache_authority(knot_pkt_t *pkt, namedb_txn_t *txn, mm_ctx_t *p
 	for (unsigned i = 0; i < ns->count; ++i) {
 		const knot_rrset_t *rr = knot_pkt_rr(ns, i);
 		if (rr->type == KNOT_RRTYPE_NS) {
+			/* Cache in-bailiwick data only */
+			if (!knot_dname_in(cut->name, rr->owner)) {
+				return KNOT_ENOENT;
+			}
 			/* Cache glue (if contains) */
 			for (unsigned i = 0; i < sizeof(type_list)/sizeof(uint16_t); ++i) {
 				knot_dname_t *owner = (knot_dname_t *)knot_ns_name(&rr->rrs, 0);
@@ -221,8 +251,8 @@ static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 	/* Open write transaction */
 	mm_ctx_t *pool = rplan->pool;
 	uint32_t timestamp = query->timestamp.tv_sec;
-	struct kr_cache *cache = req->ctx->cache;
-	namedb_txn_t txn;
+	struct kr_cache *cache = &req->ctx->cache;
+	struct kr_cache_txn txn;
 	if (kr_cache_txn_begin(cache, &txn, 0) != 0) {
 		return ctx->state; /* Couldn't acquire cache, ignore. */
 	}
@@ -233,12 +263,13 @@ static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 		ret = write_cache_answer(pkt, &txn, pool, timestamp);
 	}
 	if (ret == KNOT_EOK) {
-		ret = write_cache_authority(pkt, &txn, pool, timestamp);
+		ret = write_cache_authority(&query->zone_cut, pkt, &txn, pool, timestamp);
 	}
 
 	/* Cache full, do what we must. */
 	if (ret == KNOT_ESPACE) {
 		kr_cache_clear(&txn);
+		kr_cache_txn_commit(&txn);
 	} else {
 		kr_cache_txn_commit(&txn);
 	}

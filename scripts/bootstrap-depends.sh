@@ -3,9 +3,9 @@ set -e
 
 CMOCKA_TAG="cmocka-0.4.1"
 CMOCKA_URL="git://git.cryptomilk.org/projects/cmocka.git"
-LIBUV_TAG="v1.3.0"
+LIBUV_TAG="v1.5.0"
 LIBUV_URL="https://github.com/libuv/libuv.git"
-KNOT_TAG="master"
+KNOT_TAG="edc125bc"
 KNOT_URL="https://github.com/CZ-NIC/knot.git"
 GMP_TAG="6.0.0"
 GMP_URL="https://gmplib.org/download/gmp/gmp-${GMP_TAG}.tar.xz"
@@ -23,7 +23,7 @@ PREFIX=${1}; [ -z ${PREFIX} ] && export PREFIX="${HOME}/.local"
 install -d ${PREFIX}/{lib,libexec,include,bin,sbin,man,share,etc,info,doc,var}
 
 # prepare build env
-export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
+export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
 export BUILD_DIR="$(pwd)/.build-depend"
 export LOG=$(pwd)/build.log
 [ ! -e ${BUILD_DIR} ] && mkdir ${BUILD_DIR}; cd ${BUILD_DIR}
@@ -37,7 +37,8 @@ trap on_failure ERR
 
 function fetch_pkg {
 	if [ "${2##*.}" == git ]; then
-		[ ! -e $1 ] && git clone -b $3 "$2" $1 &> /dev/null
+		[ ! -e $1 ] && git clone "$2" $1 &> /dev/null
+		cd $1; git checkout $3 &> /dev/null; cd -
 	else
 		[ ! -f $1.tar.${2##*.} ] && curl "$2" > $1.tar.${2##*.}
 		tar xf $1.tar.${2##*.}
@@ -46,16 +47,16 @@ function fetch_pkg {
 }
 
 function build_pkg {
-	if [ -f CMakeLists.txt ]; then
-		[ -e cmake-build ] && rm -rf cmake-build; mkdir cmake-build; cd cmake-build
-		cmake -DCMAKE_INSTALL_PREFIX=${PREFIX} ..
-		make ${MAKEOPTS}
-		make install
-	elif [ -f configure.ac ]; then
+	if [ -f configure.ac ]; then
 		if [ ! -e ./configure ]; then
 			[ -e autogen.sh ] && sh autogen.sh || autoreconf -if
 		fi
 		./configure --prefix=${PREFIX} --enable-shared $*
+		make ${MAKEOPTS}
+		make install
+	elif [ -f CMakeLists.txt ]; then
+		[ -e cmake-build ] && rm -rf cmake-build; mkdir cmake-build; cd cmake-build
+		cmake -DCMAKE_INSTALL_PREFIX=${PREFIX} ..
 		make ${MAKEOPTS}
 		make install
 	else
@@ -79,7 +80,8 @@ PIP_PKGS="${TRAVIS_BUILD_DIR}/tests/pydnstest/requirements.txt cpp-coveralls"
 if [ "${TRAVIS_OS_NAME}" == "osx" ]; then
 	DEPEND_CACHE="https://dl.dropboxusercontent.com/u/2255176/resolver-${TRAVIS_OS_NAME}-cache.tar.gz"
 	curl "${DEPEND_CACHE}" > cache.tar.gz && tar -xz -C ${HOME} -f cache.tar.gz || true
-	brew install --force makedepend python || true
+	brew update
+	brew install --force makedepend python libtasn1 || true
 	brew link --overwrite python || true
 	pip install --upgrade pip || true
 	pip install -r ${PIP_PKGS}
@@ -107,7 +109,7 @@ pkg cmocka ${CMOCKA_URL} ${CMOCKA_TAG} include/cmocka.h
 # libuv
 pkg libuv ${LIBUV_URL} ${LIBUV_TAG} include/uv.h --disable-static
 # lua
-pkg lua ${LUA_URL} ${LUA_TAG} include/lua.h generic install INSTALL_TOP=${PREFIX}
+pkg lua ${LUA_URL} ${LUA_TAG} include/lua.h posix install INSTALL_TOP=${PREFIX} MYCFLAGS="-DLUA_USE_DLOPEN" MYLDFLAGS="-ldl"
 if [ ! -f ${PREFIX}/lib/pkgconfig/lua.pc ]; then
 cat > ${PREFIX}/lib/pkgconfig/lua.pc << EOF
 prefix=${PREFIX}

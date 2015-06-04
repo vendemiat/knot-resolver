@@ -1,6 +1,7 @@
 import dns.message
 import dns.rrset
 import dns.rcode
+import dns.dnssec
 
 class Entry:
     """
@@ -135,6 +136,9 @@ class Entry:
         rdtype = args.pop(0)
         rr = dns.rrset.from_text(owner, ttl, rdclass, rdtype)
         if len(args) > 0:
+            if (rr.rdtype == dns.rdatatype.DS):
+                # convert textual algorithm identifier to number
+                args[1] = str(dns.dnssec.algorithm_from_text(args[1]))
             rd = dns.rdata.from_text(rr.rdclass, rr.rdtype, ' '.join(args), origin=dns.name.from_text(self.origin), relativize=False)
             rr.add(rd)
         return rr
@@ -244,6 +248,7 @@ class Step:
         if len(self.data) == 0:
             raise Exception("query definition required")
         msg = self.data[0].message
+        msg.use_edns(edns = 1)
         self.answer = ctx.resolve(msg.to_wire())
         if self.answer is not None:
             self.answer = dns.message.from_wire(self.answer)

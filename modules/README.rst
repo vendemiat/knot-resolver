@@ -139,6 +139,22 @@ The modules follow the `Lua way <http://lua-users.org/wiki/ModuleDefinition>`_, 
 
 	return counter
 
+.. tip:: The API functions may return an integer value just like in other languages, but they may also return a coroutine that will be continued asynchronously. A good use case for this approach is is a deferred initialization, e.g. loading a chunks of data or waiting for I/O.
+
+.. code-block:: lua
+
+	function counter.init(module)
+		counter.total = 0
+		counter.last = 0
+		counter.failed = 0
+		return coroutine.create(function ()
+			for line in io.lines('/etc/hosts') do
+				load(module, line)
+				coroutine.yield()
+			end
+		end)
+	end
+
 The created module can be then loaded just like any other module, except it isn't very useful since it
 doesn't provide any layer to capture events. The Lua module can however provide a processing layer, just
 :ref:`like its C counterpart <lib-layers>`.
@@ -267,7 +283,7 @@ Here's an example how a module can expose its property:
 		namedb_t *cache = engine->resolver.cache;
 
 		/* Open read transaction */
-		namedb_txn_t txn;
+		struct kr_cache_txn txn;
 		int ret = kr_cache_txn_begin(cache, &txn, NAMEDB_RDONLY);
 		if (ret != 0) {
 			return NULL;

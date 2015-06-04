@@ -21,6 +21,7 @@
  * The module provides an override for queried address records.
  */
 
+#include <ccan/json/json.h>
 #include <libknot/packet/pkt.h>
 #include <libknot/descriptor.h>
 #include <libknot/internal/lists.h>
@@ -42,11 +43,15 @@ static int begin(knot_layer_t *ctx, void *module_param)
 	return ctx->state;
 }
 
-static int answer_query(knot_pkt_t *pkt, pack_t *addr_set, struct kr_request *param)
+static int answer_query(knot_pkt_t *pkt, pack_t *addr_set, struct kr_query *qry)
 {
-	knot_dname_t *qname = knot_dname_copy(knot_pkt_qname(pkt), &pkt->mm);
-	uint16_t rrtype = knot_pkt_qtype(pkt);
-	uint16_t rrclass = knot_pkt_qclass(pkt);
+	uint16_t rrtype = qry->stype;
+	uint16_t rrclass = qry->sclass;
+	if (rrtype != KNOT_RRTYPE_A && rrtype != KNOT_RRTYPE_AAAA) {
+		return kr_error(ENOENT);
+	}
+
+	knot_dname_t *qname = knot_dname_copy(qry->sname, &pkt->mm);
 	knot_rrset_t rr;
 	knot_rrset_init(&rr, qname, rrtype, rrclass);
 	int family_len = sizeof(struct in_addr);
@@ -80,9 +85,6 @@ static int query(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (!qry || ctx->state & (KNOT_STATE_DONE|KNOT_STATE_FAIL)) {
 		return ctx->state;
 	}
-	if (qry->stype != KNOT_RRTYPE_A && qry->stype != KNOT_RRTYPE_AAAA) {
-		return ctx->state;
-	}
 
 	/* Find a matching name */
 	struct kr_module *module = ctx->api->data;
@@ -93,12 +95,13 @@ static int query(knot_layer_t *ctx, knot_pkt_t *pkt)
 	}
 
 	/* Write to packet */
-	int ret = answer_query(pkt, pack, param);
+	int ret = answer_query(pkt, pack, qry);
 	if (ret != 0) {
 		return ctx->state;
 	}
 	DEBUG_MSG(qry, "<= answered from hints\n");
-	qry->flags |= QUERY_CACHED;	
+	qry->flags |= QUERY_CACHED|QUERY_NO_MINIMIZE;
+	pkt->parsed = pkt->size;
 	knot_wire_set_qr(pkt->wire);
 	return KNOT_STATE_DONE;
 }
@@ -213,7 +216,7 @@ static char* hint_set(void *env, struct kr_module *module, const char *args)
 	}
 
 	char *result = NULL;
-	asprintf(&result, "{ \"result\": %s }", ret == 0 ? "true" : "false");
+	asprintf(&result, "{ \"result\": %s", ret == 0 ? "true" : "false");
 	return result;
 }
 
@@ -228,7 +231,6 @@ static char* hint_get(void *env, struct kr_module *module, const char *args)
 	struct kr_zonecut *hints = module->data;
 	knot_dname_t key[KNOT_DNAME_MAXLEN];
 	pack_t *pack = NULL;
-	size_t bufsize = 4096;
 	if (knot_dname_from_str(key, args, sizeof(key))) {
 		pack = kr_zonecut_find(hints, key);
 	}
@@ -236,28 +238,21 @@ static char* hint_get(void *env, struct kr_module *module, const char *args)
 		return NULL;
 	}
 
-	auto_free char *hint_buf = malloc(bufsize);
-	if (hint_buf == NULL) {
-		return NULL;
-	}
-	char *p = hint_buf, *endp = hint_buf + bufsize;
+	char buf[SOCKADDR_STRLEN];
+	JsonNode *root = json_mkarray();
 	uint8_t *addr = pack_head(*pack);
 	while (addr != pack_tail(*pack)) {
 		size_t len = pack_obj_len(addr);
 		int family = len == sizeof(struct in_addr) ? AF_INET : AF_INET6;
-		if (!inet_ntop(family, pack_obj_val(addr), p, endp - p)) {
+		if (!inet_ntop(family, pack_obj_val(addr), buf, sizeof(buf))) {
 			break;
 		}
-		p += strlen(p);
+		json_append_element(root, json_mkstring(buf));
 		addr = pack_obj_next(addr);
-		if (p + 2 < endp && addr != pack_tail(*pack)) {
-			strcpy(p, " ");
-			p += 1;
-		}
 	}
 
-	char *result = NULL;
-	asprintf(&result, "{ \"result\": [ %s ] }", hint_buf);
+	char *result = json_encode(root);
+	json_delete(root);
 	return result;
 }
 
