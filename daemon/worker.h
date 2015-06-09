@@ -21,8 +21,8 @@
 #include "daemon/engine.h"
 #include "lib/generic/array.h"
 
-/* @cond internal Array of memory pools. */
-typedef array_t(mm_ctx_t) mempool_ring_t;
+/* @cond internal Freelist of available mempools. */
+typedef array_t(void *) mp_freelist_t;
 /* @endcond */
 
 /**
@@ -32,10 +32,8 @@ struct worker_ctx {
 	struct engine *engine;
 	uv_loop_t *loop;
 	mm_ctx_t *mm;
-	struct {
-		uint8_t wire[KNOT_WIRE_MAX_PKTSIZE];
-		mempool_ring_t ring;
-	} bufs;
+	uint8_t wire_buf[KNOT_WIRE_MAX_PKTSIZE];
+	mp_freelist_t pools;
 };
 
 /**

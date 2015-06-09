@@ -17,11 +17,14 @@
 #pragma once
 
 /* Magic defaults */
-#ifndef DEFAULT_NSREP_SIZE
-#define DEFAULT_NSREP_SIZE 4096 /**< Default NS reputation cache size */
+#ifndef LRU_RTT_SIZE
+#define LRU_RTT_SIZE 4096 /**< NS RTT cache size */
 #endif
-#ifndef DEFAULT_RING_SIZE
-#define DEFAULT_RING_SIZE 16 /**< Maximum size of the worker ring size */
+#ifndef LRU_REP_SIZE
+#define LRU_REP_SIZE (LRU_RTT_SIZE / 2) /**< NS reputation cache size */
+#endif
+#ifndef MP_FREELIST_SIZE
+#define MP_FREELIST_SIZE 32 /**< Maximum length of the worker mempool freelist */
 #endif
 
 /*

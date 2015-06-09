@@ -14,10 +14,11 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <malloc.h>
 #include <uv.h>
 #include <libknot/packet/pkt.h>
 #include <libknot/internal/net.h>
-#include <libknot/internal/mempool.h>
+#include <ucw/mempool.h>
 
 #include "daemon/worker.h"
 #include "daemon/engine.h"
@@ -63,14 +64,16 @@ static int parse_query(knot_pkt_t *query)
 
 static struct qr_task *qr_task_create(struct worker_ctx *worker, uv_handle_t *handle, knot_pkt_t *query, const struct sockaddr *addr)
 {
-	/* Recycle mempool from ring or create it */
-	mm_ctx_t pool;
-	mempool_ring_t *ring = &worker->bufs.ring;
-	if (ring->len > 0) {
-		pool = array_tail(*ring);
-		array_pop(*ring);
-	} else {
-		mm_ctx_mempool(&pool, KNOT_WIRE_MAX_PKTSIZE);
+	/* Recycle available mempool if possible */
+	mm_ctx_t pool = {
+		.ctx = NULL,
+		.alloc = (mm_alloc_t) mp_alloc
+	};
+	if (worker->pools.len > 0) {
+		pool.ctx = array_tail(worker->pools);
+		array_pop(worker->pools);
+	} else { /* No mempool on the freelist, create new one */
+		pool.ctx = mp_new (16 * CPU_PAGE_SIZE);
 	}
 
 	/* Create worker task */
@@ -129,12 +132,20 @@ static void qr_task_free(uv_handle_t *handle)
 	}
 	/* Return mempool to ring or free it if it's full */
 	struct worker_ctx *worker = task->worker;
-	mempool_ring_t *ring = &worker->bufs.ring;
-	if (ring->len < ring->cap) {
-		mp_flush(task->req.pool.ctx);
-		array_push(*ring, task->req.pool);
+	void *mp_context = task->req.pool.ctx;
+	if (worker->pools.len < MP_FREELIST_SIZE) {
+		mp_flush(mp_context);
+		array_push(worker->pools, mp_context);
 	} else {
-		mp_delete(task->req.pool.ctx);
+		mp_delete(mp_context);
+#ifdef _GNU_SOURCE
+		/* Decommit memory every once in a while */
+		static int mp_delete_count = 0;
+		if (++mp_delete_count == 1000) {
+			malloc_trim(0);
+			mp_delete_count = 0;
+		}
+#endif
 	}
 }
 
@@ -282,14 +293,15 @@ int worker_exec(struct worker_ctx *worker, uv_handle_t *handle, knot_pkt_t *quer
 
 int worker_reserve(struct worker_ctx *worker, size_t ring_maxlen)
 {
-	return array_reserve(worker->bufs.ring, ring_maxlen);
+	array_init(worker->pools);
+	return array_reserve(worker->pools, ring_maxlen);
 }
 
 void worker_reclaim(struct worker_ctx *worker)
 {
-	mempool_ring_t *ring = &worker->bufs.ring;
-	for (unsigned i = 0; i < ring->len; ++i) {
-		mp_delete(ring->at[i].ctx);
+	mp_freelist_t *pools = &worker->pools;
+	for (unsigned i = 0; i < pools->len; ++i) {
+		mp_delete(pools->at[i]);
 	}
-	array_clear(*ring);
+	array_clear(*pools);
 }
