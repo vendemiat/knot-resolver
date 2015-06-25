@@ -14,11 +14,13 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <malloc.h>
 #include <uv.h>
 #include <libknot/packet/pkt.h>
 #include <libknot/internal/net.h>
 #include <ucw/mempool.h>
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+#include <malloc.h>
+#endif
 
 #include "daemon/worker.h"
 #include "daemon/engine.h"
@@ -138,10 +140,10 @@ static void qr_task_free(uv_handle_t *handle)
 		array_push(worker->pools, mp_context);
 	} else {
 		mp_delete(mp_context);
-#ifdef _GNU_SOURCE
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
 		/* Decommit memory every once in a while */
-		static int mp_delete_count = 0;
-		if (++mp_delete_count == 1000) {
+		static size_t mp_delete_count = 0;
+		if (++mp_delete_count == 100 * MP_FREELIST_SIZE) {
 			malloc_trim(0);
 			mp_delete_count = 0;
 		}

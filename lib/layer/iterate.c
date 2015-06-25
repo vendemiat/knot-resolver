@@ -14,12 +14,12 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <ctype.h>
 #include <sys/time.h>
 
 #include <libknot/descriptor.h>
 #include <libknot/rrtype/rdname.h>
 
-#include "ccan/isaac/isaac.h"
 #include "lib/layer/iterate.h"
 #include "lib/resolve.h"
 #include "lib/rplan.h"
@@ -27,23 +27,10 @@
 #include "lib/nsrep.h"
 #include "lib/module.h"
 
-#define SEED_SIZE 256
 #define DEBUG_MSG(fmt...) QRDEBUG(kr_rplan_current(&req->rplan), "iter", fmt)
 
 /* Iterator often walks through packet section, this is an abstraction. */
 typedef int (*rr_callback_t)(const knot_rrset_t *, unsigned, struct kr_request *);
-
-/** @internal CSPRNG context */
-static isaac_ctx ISAAC;
-
-/** @internal Reseed isaac context. */
-int iterate_init(struct kr_module *module)
-{
-	uint8_t seed[SEED_SIZE];
-	kr_randseed((char *)seed, sizeof(seed));
-	isaac_reseed(&ISAAC, seed, sizeof(seed));
-	return kr_ok();
-}
 
 /** Return minimized QNAME/QTYPE for current zone cut. */
 static const knot_dname_t *minimized_qname(struct kr_query *query, uint16_t *qtype)
@@ -70,11 +57,39 @@ static const knot_dname_t *minimized_qname(struct kr_query *query, uint16_t *qty
 	return qname;
 }
 
+/* Randomize QNAME letter case.
+ * This adds 32 bits of randomness at maximum, but that's more than an average domain name length.
+ * https://tools.ietf.org/html/draft-vixie-dnsext-dns0x20-00
+ */
+static void randomized_qname_case(knot_dname_t *qname, unsigned secret)
+{
+	unsigned k = 0;
+	while (*qname != '\0') {
+		for (unsigned i = *qname; i--;) {
+			int chr = qname[i + 1];
+			if (isalpha(chr)) {
+				if (secret & (1 << k)) {
+					qname[i + 1] ^= 0x20;
+				}
+				k = (k + 1) % (sizeof(secret) * CHAR_BIT);
+			}
+		}
+		qname = (uint8_t *)knot_wire_next_label(qname, NULL);
+	}
+}
+
 /** Answer is paired to query. */
 static bool is_paired_to_query(const knot_pkt_t *answer, struct kr_query *query)
 {
 	uint16_t qtype = query->stype;
-	const knot_dname_t *qname = minimized_qname(query, &qtype);
+	const knot_dname_t *qname_min = minimized_qname(query, &qtype);
+
+	/* Construct expected randomized QNAME */
+	uint8_t qname[KNOT_DNAME_MAXLEN];
+	knot_dname_to_wire(qname, qname_min, sizeof(qname));
+	if (!(query->flags & (QUERY_CACHED|QUERY_SAFEMODE))) {
+		randomized_qname_case(qname, query->secret);
+	}
 
 	return query->id      == knot_wire_get_id(answer->wire) &&
 	       (query->sclass == KNOT_CLASS_ANY || query->sclass  == knot_pkt_qclass(answer)) &&
@@ -367,9 +382,15 @@ int kr_make_query(struct kr_query *query, knot_pkt_t *pkt)
 		return ret;
 	}
 
+	/* Randomize query case (if not in safemode) */
+	query->secret = (query->flags & QUERY_SAFEMODE) ? 0 : kr_rand_uint(UINT32_MAX);
+	knot_dname_t *qname_raw = (knot_dname_t *)knot_pkt_qname(pkt);
+	randomized_qname_case(qname_raw, query->secret);
+
 	/* Query built, expect answer. */
-	query->id = isaac_next_uint(&ISAAC, UINT16_MAX);
+	query->id = kr_rand_uint(UINT16_MAX);
 	knot_wire_set_id(pkt->wire, query->id);
+	pkt->parsed = pkt->size;
 	return kr_ok();
 }
 
@@ -440,6 +461,10 @@ static int resolve(knot_layer_t *ctx, knot_pkt_t *pkt)
 		}
 		return KNOT_STATE_DONE;
 	}
+
+	/* Packet cleared, normalize QNAME. */
+	knot_dname_t *qname_raw = (knot_dname_t *)knot_pkt_qname(pkt);
+	knot_dname_to_lower(qname_raw);
 
 	/* Check response code. */
 #ifndef NDEBUG

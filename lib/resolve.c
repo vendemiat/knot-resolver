@@ -53,17 +53,17 @@ static int ns_fetch_cut(struct kr_query *qry, struct kr_request *req)
 {
 	struct kr_cache_txn txn;
 	int ret = 0;
+
+	/* If at/subdomain of parent zone cut, start top-down search */
+	struct kr_query *parent = qry->parent;
+	if (parent && knot_dname_in(parent->zone_cut.name, qry->sname)) {
+		return kr_zonecut_set_sbelt(req->ctx, &qry->zone_cut);
+	}
+	/* Find closest zone cut from cache */
 	if (kr_cache_txn_begin(&req->ctx->cache, &txn, NAMEDB_RDONLY) != 0) {
-		ret = kr_zonecut_set_sbelt(&qry->zone_cut);
+		ret = kr_zonecut_set_sbelt(req->ctx, &qry->zone_cut);
 	} else {
-		/* If at/subdomain of parent zone cut, start from 'one up' to avoid loops */
-		struct kr_query *parent = qry->parent;
-		const knot_dname_t *start_from = qry->sname;
-		if (parent && knot_dname_in(parent->zone_cut.name, qry->sname)) {
-			start_from = parent->zone_cut.name;
-		}
-		/* Find closest zone cut from cache */
-		ret = kr_zonecut_find_cached(req->ctx, &qry->zone_cut, start_from, &txn, qry->timestamp.tv_sec);
+		ret = kr_zonecut_find_cached(req->ctx, &qry->zone_cut, qry->sname, &txn, qry->timestamp.tv_sec);
 		kr_cache_txn_abort(&txn);
 	}
 	return ret;
@@ -94,7 +94,7 @@ static int ns_resolve_addr(struct kr_query *qry, struct kr_request *param)
 	if (!next_type || kr_rplan_satisfies(qry->parent, qry->ns.name, KNOT_CLASS_IN, next_type)) {
 		/* No IPv4 nor IPv6, flag server as unuseable. */
 		DEBUG_MSG("=> unresolvable NS address, bailing out\n");
-		kr_nsrep_update_rep(&qry->ns, qry->ns.reputation | KR_NS_NOIP6, ctx->cache_rep);
+		kr_nsrep_update_rep(&qry->ns, qry->ns.reputation | KR_NS_NOIP4, ctx->cache_rep);
 		invalidate_ns(rplan, qry);
 		return kr_error(EHOSTUNREACH);
 	}
@@ -380,12 +380,10 @@ int kr_resolve_consume(struct kr_request *request, knot_pkt_t *packet)
 		state = knot_overlay_consume(&request->overlay, packet);
 	}
 
-	/* Resolution failed, invalidate current NS and reset to UDP. */
+	/* Resolution failed, invalidate current NS. */
 	if (state == KNOT_STATE_FAIL) {
 		kr_nsrep_update_rtt(&qry->ns, KR_NS_TIMEOUT, ctx->cache_rtt);
-		if (invalidate_ns(rplan, qry) == 0) {
-			qry->flags &= ~QUERY_TCP;
-		}
+		invalidate_ns(rplan, qry);
 	/* Track RTT for iterative answers */
 	} else if (!(qry->flags & QUERY_CACHED)) {
 		struct timeval now;
@@ -397,7 +395,7 @@ int kr_resolve_consume(struct kr_request *request, knot_pkt_t *packet)
 	if (qry->flags & QUERY_RESOLVED) {
 		kr_rplan_pop(rplan, qry);
 	} else { /* Clear query flags for next attempt */
-		qry->flags &= ~QUERY_CACHED;
+		qry->flags &= ~(QUERY_CACHED|QUERY_TCP);
 	}
 
 	knot_overlay_reset(&request->overlay);
