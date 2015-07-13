@@ -112,6 +112,12 @@ static bool is_authoritative(const knot_pkt_t *answer, struct kr_query *query)
 		}
 	}
 
+#ifndef STRICT_MODE
+	/* Last resort to work around broken auths, if the zone cut is at/parent of the QNAME. */
+	if (knot_dname_is_equal(query->zone_cut.name, knot_pkt_qname(answer))) {
+		return true;
+	}
+#endif
 	return false;
 }
 
@@ -144,7 +150,7 @@ static void follow_cname_chain(const knot_dname_t **cname, const knot_rrset_t *r
 static int update_nsaddr(const knot_rrset_t *rr, struct kr_query *query)
 {
 	if (rr->type == KNOT_RRTYPE_A || rr->type == KNOT_RRTYPE_AAAA) {
-		const knot_rdata_t *rdata = knot_rdataset_at(&rr->rrs, 0);
+		const knot_rdata_t *rdata = rr->rrs.data;
 		int ret = kr_zonecut_add(&query->zone_cut, rr->owner, rdata);
 		if (ret != 0) {
 			return KNOT_STATE_FAIL;
@@ -245,6 +251,15 @@ static int process_authority(knot_pkt_t *pkt, struct kr_request *req)
 	/* AA, terminate resolution chain. */
 	if (knot_wire_get_aa(pkt->wire)) {
 		return KNOT_STATE_CONSUME;
+	}
+#else
+	/* Work around servers sending back CNAME with different delegation and no AA. */
+	const knot_pktsection_t *an = knot_pkt_section(pkt, KNOT_ANSWER);
+	if (an->count > 0 && ns->count > 0) {
+		const knot_rrset_t *rr = knot_pkt_rr(an, 0);
+		if (rr->type == KNOT_RRTYPE_CNAME) {
+			return KNOT_STATE_CONSUME;
+		}
 	}
 #endif
 
@@ -448,7 +463,10 @@ static int resolve(knot_layer_t *ctx, knot_pkt_t *pkt)
 		return resolve_badmsg(pkt, req, query);
 	} else if (!is_paired_to_query(pkt, query)) {
 		DEBUG_MSG("<= ignoring mismatching response\n");
-		return KNOT_STATE_CONSUME;
+		/* Force TCP, to work around authoritatives messing up question
+		 * without yielding to spoofed responses. */
+		query->flags |= QUERY_TCP;
+		return resolve_badmsg(pkt, req, query);
 	} else if (knot_wire_get_tc(pkt->wire)) {
 		DEBUG_MSG("<= truncated response, failover to TCP\n");
 		if (query) {

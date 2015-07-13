@@ -143,6 +143,26 @@ int kr_zonecut_copy(struct kr_zonecut *dst, const struct kr_zonecut *src)
 	return map_walk((map_t *)&src->nsset, copy_addr_set, dst);
 }
 
+/** @internal Filter ANY or loopback addresses. */
+static bool is_valid_addr(uint8_t *addr, size_t len)
+{
+	if (len == sizeof(struct in_addr)) {
+		/* Filter ANY and 127.0.0.0/8 */
+		uint32_t ip_host = ntohl(*(uint32_t *)(addr));
+		if (ip_host == 0 || (ip_host & 0xff000000) == 0x7f000000) {
+			return false;
+		}
+	} else if (len == sizeof(struct in6_addr)) {
+		struct in6_addr ip6_mask;
+		memset(&ip6_mask, 0, sizeof(ip6_mask));
+		/* All except last byte are zeroed, last byte defines ANY/::1 */
+		if (memcmp(addr, ip6_mask.s6_addr, sizeof(ip6_mask.s6_addr) - 1) == 0) {
+			return (addr[len - 1] > 1);
+		}
+	}
+	return true;
+}
+
 int kr_zonecut_add(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rdata_t *rdata)
 {
 	if (!cut || !ns) {
@@ -162,9 +182,14 @@ int kr_zonecut_add(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rd
 	if (rdata == NULL) {
 		return kr_ok();
 	}
-	/* Check for duplicates */
+	/* Check for invalid */
 	uint16_t rdlen = knot_rdata_rdlen(rdata);
-	if (pack_obj_find(pack, knot_rdata_data(rdata), rdlen)) {
+	uint8_t *raw_addr = knot_rdata_data(rdata);
+	if (!is_valid_addr(raw_addr, rdlen)) {
+		return kr_error(EILSEQ);
+	}
+	/* Check for duplicates */
+	if (pack_obj_find(pack, raw_addr, rdlen)) {
 		return kr_ok();
 	}
 	/* Push new address */
@@ -250,12 +275,12 @@ static void fetch_addr(struct kr_zonecut *cut, const knot_dname_t *ns, uint16_t 
 		return;
 	}
 
-	knot_rdata_t *rd = knot_rdataset_at(&cached_rr.rrs, 0);
+	knot_rdata_t *rd = cached_rr.rrs.data;
 	for (uint16_t i = 0; i < cached_rr.rrs.rr_count; ++i) {
 		if (knot_rdata_ttl(rd) > timestamp) {
 			(void) kr_zonecut_add(cut, ns, rd);
 		}
-		rd += knot_rdata_array_size(knot_rdata_rdlen(rd));
+		rd = kr_rdataset_next(rd);
 	}
 }
 

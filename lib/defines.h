@@ -25,7 +25,10 @@
  * Error codes.
  */
 #define kr_ok() 0
-#define kr_error(x) -abs(x)
+/* Mark as cold to mark all branches as unlikely. */
+static inline int __attribute__((__cold__)) kr_error(int x) {
+	return -abs(x);
+}
 #define kr_strerror(x) strerror(abs(x))
 
 /*
@@ -34,11 +37,6 @@
  */
 #define KR_CONN_RTT_MAX 3000 /* Timeout for network activity */
 #define KR_ITER_LIMIT 50        /* Built-in iterator limit */
-
-/*
- * Timers.
- */
-#define KR_TTL_GRACE  ((KR_CONN_RTT_MAX) / 1000) /* TTL expire grace period. */
 
 /*
  * Defines.
