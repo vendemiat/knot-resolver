@@ -16,6 +16,8 @@
 
 #include <libknot/errcode.h>
 #include <libknot/internal/utils.h>
+#include <contrib/ucw/lib.h>
+#include <contrib/ucw/mempool.h>
 
 #include "daemon/io.h"
 #include "daemon/network.h"
@@ -58,15 +60,14 @@ void udp_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
 		return;
 	}
 
-	knot_pkt_t *query = knot_pkt_new(buf->base, nread, worker->mm);
+	knot_pkt_t *query = knot_pkt_new(buf->base, nread, &worker->pkt_pool);
 	query->max_size = KNOT_WIRE_MAX_PKTSIZE;
 	worker_exec(worker, (uv_handle_t *)handle, query, addr);
-	knot_pkt_free(&query);
+	mp_flush(worker->pkt_pool.ctx);
 }
 
-int udp_bind(struct endpoint *ep, struct sockaddr *addr)
+int udp_bind(uv_udp_t *handle, struct sockaddr *addr)
 {
-	uv_udp_t *handle = &ep->udp;
 	unsigned flags = UV_UDP_REUSEADDR;
 	if (addr->sa_family == AF_INET6) {
 		flags |= UV_UDP_IPV6ONLY;
@@ -80,36 +81,20 @@ int udp_bind(struct endpoint *ep, struct sockaddr *addr)
 	return io_start_read((uv_handle_t *)handle);
 }
 
-void udp_unbind(struct endpoint *ep)
-{
-	uv_udp_t *handle = &ep->udp;
-	uv_close((uv_handle_t *)handle, NULL);
-}
-
 static void tcp_recv(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 {
 	uv_loop_t *loop = handle->loop;
 	struct worker_ctx *worker = loop->data;
 
-	/* Check for originator connection close / not enough bytes */
-	if (nread < 2) {
-		if (!handle->data) {
-			/* @todo Notify the endpoint if master socket */
+	/* Check for originator connection close. */
+	if (nread <= 0) {
+		if (handle->data) {
+			worker_exec(worker, (uv_handle_t *)handle, NULL, NULL);
 		}
-		worker_exec(worker, (uv_handle_t *)handle, NULL, NULL);
 		return;
 	}
-
-	/** @todo This is not going to work if the packet is fragmented in the stream ! */
-	uint16_t nbytes = wire_read_u16((const uint8_t *)buf->base);
-	if (nbytes + 2 < nread) {
-		worker_exec(worker, (uv_handle_t *)handle, NULL, NULL);
-		return;
-	}
-
-	knot_pkt_t *query = knot_pkt_new(buf->base + 2, nbytes, worker->mm);
-	query->max_size = sizeof(worker->wire_buf);
-	int ret = worker_exec(worker, (uv_handle_t *)handle, query, NULL);
+	
+	int ret = worker_process_tcp(worker, (uv_handle_t *)handle, (const uint8_t *)buf->base, nread);
 	if (ret == 0) {
 		/* Push - pull, stop reading from this handle until
 		 * the task is finished. Since the handle has no track of the
@@ -118,7 +103,7 @@ static void tcp_recv(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 		uv_unref((uv_handle_t *)handle);
 		io_stop_read((uv_handle_t *)handle);
 	}
-	knot_pkt_free(&query);
+	mp_flush(worker->pkt_pool.ctx);
 }
 
 static void tcp_accept(uv_stream_t *master, int status)
@@ -131,6 +116,7 @@ static void tcp_accept(uv_stream_t *master, int status)
 	if (!client) {
 		return;
 	}
+	memset(client, 0, sizeof(*client));
 	io_create(master->loop, (uv_handle_t *)client, SOCK_STREAM);
 	if (uv_accept(master, client) != 0) {
 		handle_free((uv_handle_t *)client);
@@ -140,9 +126,8 @@ static void tcp_accept(uv_stream_t *master, int status)
 	io_start_read((uv_handle_t *)client);
 }
 
-int tcp_bind(struct endpoint *ep, struct sockaddr *addr)
+int tcp_bind(uv_tcp_t *handle, struct sockaddr *addr)
 {
-	uv_tcp_t *handle = &ep->tcp;
 	unsigned flags = UV_UDP_REUSEADDR;
 	if (addr->sa_family == AF_INET6) {
 		flags |= UV_UDP_IPV6ONLY;
@@ -154,17 +139,11 @@ int tcp_bind(struct endpoint *ep, struct sockaddr *addr)
 
 	ret = uv_listen((uv_stream_t *)handle, 16, tcp_accept);
 	if (ret != 0) {
-		tcp_unbind(ep);
 		return ret;
 	}
 
 	handle->data = NULL;
 	return 0;
-}
-
-void tcp_unbind(struct endpoint *ep)
-{
-	uv_close((uv_handle_t *)&ep->tcp, NULL);
 }
 
 void io_create(uv_loop_t *loop, uv_handle_t *handle, int type)

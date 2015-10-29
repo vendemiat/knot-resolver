@@ -1,7 +1,7 @@
 # Platform-specific
 CCLD := $(CC)
 CGO := go tool cgo
-GCCGO := gccgo
+GO := go
 LIBEXT := .so
 MODEXT := $(LIBEXT)
 AREXT  := .a
@@ -24,7 +24,7 @@ else
         MODTYPE := dynamiclib
     else
         PLATFORM := POSIX
-        LDFLAGS += -pthread
+        LDFLAGS += -pthread -lm -Wl,-E
         ifeq (,$(findstring BSD,$(UNAME)))
             LDFLAGS += -ldl
         endif
@@ -39,7 +39,7 @@ else
 endif	
 
 %.o: %.c
-	$(call quiet,CC,$<) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(call quiet,CC,$<) $(BUILD_CFLAGS) -MMD -MP -c $< -o $@
 
 # Make objects and depends (name)
 define make_objs
@@ -56,7 +56,7 @@ $(2)/$(1)$(3): $$($(1)_OBJ) $$($(1)_DEPEND)
 ifeq ($(4),-$(ARTYPE))
 	$(call quiet,AR,$$@) rcs $$@ $$($(1)_OBJ)
 else
-	$(call quiet,CCLD,$$@) $(CFLAGS) $$($(1)_OBJ) -o $$@ $(4) $$($(1)_LIBS) $(LDFLAGS)
+	$(call quiet,CCLD,$$@) $(BUILD_CFLAGS) $$($(1)_OBJ) -o $$@ $(4) $$($(1)_LIBS) $(BUILD_LDFLAGS)
 endif
 $(1)-clean:
 	$(RM) $$($(1)_OBJ) $$($(1)_DEP) $(2)/$(1)$(3)
@@ -71,7 +71,7 @@ endif
 endef
 
 # Make targets (name,path)
-make_bin = $(call make_target,$(1),$(2),$(BINEXT),,$(BINDIR))
+make_bin = $(call make_target,$(1),$(2),$(BINEXT),$(BINFLAGS),$(BINDIR))
 make_lib = $(call make_target,$(1),$(2),$(LIBEXT),-$(LIBTYPE),$(LIBDIR))
 make_module = $(call make_target,$(1),$(2),$(LIBEXT),-$(LIBTYPE),$(MODULEDIR))
 make_shared = $(call make_target,$(1),$(2),$(MODEXT),-$(MODTYPE),$(LIBDIR))
@@ -118,9 +118,17 @@ define find_bin
 	endif
 endef
 
-# Find Python 
-define find_python
-	python_CFLAGS := $(shell $(PYTHON) -c "from distutils import sysconfig as c;print('-I%s' % c.get_python_inc())")
-	python_LIBS := $(shell $(PYTHON) -c "from distutils import sysconfig as c;print('-L%s -lpython%s' % (c.get_config_var('LIBDIR'), c.get_config_var('VERSION')))")
-	$(call have_lib,python)
+# Find version
+define find_ver
+	ifeq ($(shell test $(2) -ge $(3); echo $$?),0)
+		HAS_$(1) := yes
+	else
+		HAS_$(1) := no
+	endif
 endef
+
+# Find Go package
+define find_gopkg
+	HAS_$(1) := $(shell go list $(2) > /dev/null 2>&1 && echo yes || echo no)
+endef
+

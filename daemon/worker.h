@@ -31,7 +31,6 @@ typedef array_t(void *) mp_freelist_t;
 struct worker_ctx {
 	struct engine *engine;
 	uv_loop_t *loop;
-	mm_ctx_t *mm;
 #if __linux__
 	uint8_t wire_buf[RECVMMSG_BATCH * KNOT_WIRE_MAX_PKTSIZE];
 #else
@@ -46,7 +45,11 @@ struct worker_ctx {
 	} stats;
 	mp_freelist_t pools;
 	mp_freelist_t ioreqs;
+	mm_ctx_t pkt_pool;
 };
+
+/* Worker callback */
+typedef void (*worker_cb_t)(struct worker_ctx *worker, struct kr_request *req, void *baton);
 
 /**
  * Process incoming packet (query or answer to subrequest).
@@ -55,10 +58,18 @@ struct worker_ctx {
 int worker_exec(struct worker_ctx *worker, uv_handle_t *handle, knot_pkt_t *query, const struct sockaddr* addr);
 
 /**
+ * Process incoming DNS/TCP message fragment.
+ * If the fragment contains only a partial message, it is buffered.
+ * If the fragment contains a complete query or completes current fragment, execute it.
+ * @return 0, number of bytes remaining to assemble, or an error code
+ */
+int worker_process_tcp(struct worker_ctx *worker, uv_handle_t *handle, const uint8_t *msg, size_t len);
+
+/**
  * Schedule query for resolution.
  * @return 0 or an error code
  */
-int worker_resolve(struct worker_ctx *worker, knot_pkt_t *query, unsigned options);
+int worker_resolve(struct worker_ctx *worker, knot_pkt_t *query, unsigned options, worker_cb_t on_complete, void *baton);
 
 /** Reserve worker buffers */
 int worker_reserve(struct worker_ctx *worker, size_t ring_maxlen);

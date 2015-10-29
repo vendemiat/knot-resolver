@@ -9,17 +9,19 @@ kresd_SOURCES := \
 	daemon/worker.c      \
 	daemon/bindings.c    \
 	daemon/ffimodule.c   \
-	daemon/bindings/kres.c \
 	daemon/main.c
 
 # Embed resources
 daemon/engine.o: daemon/lua/sandbox.inc daemon/lua/config.inc
 %.inc: %.lua
 	@$(call quiet,XXD,$<) $< > $@
+# Installed FFI bindings
+bindings-install: daemon/lua/kres.lua daemon/lua/trust_anchors.lua
+	$(INSTALL) $^ $(PREFIX)/$(MODULEDIR)
 
 # Dependencies
 kresd_DEPEND := $(libkres)
-kresd_LIBS := $(libkres_TARGET) $(libknot_LIBS) $(libuv_LIBS) $(lua_LIBS)
+kresd_LIBS := $(libkres_TARGET) $(libknot_LIBS) $(libdnssec_LIBS) $(libuv_LIBS) $(lua_LIBS)
 
 # Make binary
 ifeq ($(HAS_lua)|$(HAS_libuv), yes|yes)
@@ -28,7 +30,7 @@ endif
 
 # Targets
 daemon: $(kresd)
-daemon-install: kresd-install
+daemon-install: kresd-install bindings-install
 daemon-clean: kresd-clean
 	@$(RM) daemon/lua/*.inc
 

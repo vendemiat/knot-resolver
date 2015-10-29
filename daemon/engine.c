@@ -15,8 +15,11 @@
  */
 
 #include <ccan/json/json.h>
+#include <ccan/asprintf/asprintf.h>
 #include <uv.h>
 #include <unistd.h>
+#include <grp.h>
+#include <pwd.h>
 #include <libknot/internal/mempattern.h>
 /* #include <libknot/internal/namedb/namedb_trie.h> @todo Not supported (doesn't keep value copy) */
 #include <libknot/internal/namedb/namedb_lmdb.h>
@@ -27,6 +30,7 @@
 #include "lib/nsrep.h"
 #include "lib/cache.h"
 #include "lib/defines.h"
+#include "lib/dnssec/ta.h"
 
 /** @internal Compatibility wrapper for Lua < 5.2 */
 #if LUA_VERSION_NUM < 502
@@ -52,18 +56,98 @@ static int l_help(lua_State *L)
 		"help()\n    show this help\n"
 		"quit()\n    quit\n"
 		"hostname()\n    hostname\n"
+		"user(name[, group])\n    change process user (and group)\n"
+		"verbose(true|false)\n    toggle verbose mode\n"
+		"option(opt[, new_val])\n    get/set server option\n"
 		;
 	lua_pushstring(L, help_str);
+	return 1;
+}
+
+static bool update_privileges(int uid, int gid)
+{
+	if ((gid_t)gid != getgid()) {
+		if (setregid(gid, gid) < 0) {
+			return false;
+		}
+	}
+	if ((uid_t)uid != getuid()) {
+		if (setreuid(uid, uid) < 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/** Set process user/group. */
+static int l_setuser(lua_State *L)
+{
+	int n = lua_gettop(L);
+	if (n < 1 || !lua_isstring(L, 1)) {
+		lua_pushliteral(L, "user(user[, group)");
+		lua_error(L);
+	}
+	/* Fetch UID/GID based on string identifiers. */
+	struct passwd *user_pw = getpwnam(lua_tostring(L, 1));
+	if (!user_pw) {
+		lua_pushliteral(L, "invalid user name");
+		lua_error(L);
+	}
+	int uid = user_pw->pw_uid;
+	int gid = getgid();
+	if (n > 1 && lua_isstring(L, 2)) {
+		struct group *group_pw = getgrnam(lua_tostring(L, 2));
+		if (!group_pw) {
+			lua_pushliteral(L, "invalid group name");
+			lua_error(L);
+		}
+		gid = group_pw->gr_gid;
+	}
+	/* Drop privileges */
+	bool ret = update_privileges(uid, gid);
+	if (!ret) {
+		lua_pushstring(L, strerror(errno));
+		lua_error(L);
+	}
+	lua_pushboolean(L, ret);
+	return 1;
+}
+
+/** Return platform-specific versioned library name. */
+static int l_libpath(lua_State *L)
+{
+	int n = lua_gettop(L);
+	if (n < 2)
+		return 0;
+	auto_free char *lib_path = NULL;
+	const char *lib_name = lua_tostring(L, 1);
+	const char *lib_version = lua_tostring(L, 2);
+#if defined(__APPLE__)
+	lib_path = afmt("%s.%s.dylib", lib_name, lib_version);
+#elif _WIN32
+	lib_path = afmt("%s.dll", lib_name); /* Versioned in RC files */
+#else
+	lib_path = afmt("%s.so.%s", lib_name, lib_version);
+#endif
+	lua_pushstring(L, lib_path);
 	return 1;
 }
 
 /** Quit current executable. */
 static int l_quit(lua_State *L)
 {
-	/* Stop engine */
 	engine_stop(engine_luaget(L));
-	/* No results */
 	return 0;
+}
+
+/** Toggle verbose mode. */
+static int l_verbose(lua_State *L)
+{
+	if (lua_isboolean(L, 1) || lua_isnumber(L, 1)) {
+		log_debug_enable(lua_toboolean(L, 1));
+	}
+	lua_pushboolean(L, log_debug_status());
+	return 1;
 }
 
 /** Return hostname. */
@@ -72,6 +156,37 @@ static int l_hostname(lua_State *L)
 	char host_str[KNOT_DNAME_MAXLEN];
 	gethostname(host_str, sizeof(host_str));
 	lua_pushstring(L, host_str);
+	return 1;
+}
+
+/** Get/set context option. */
+static int l_option(lua_State *L)
+{
+	struct engine *engine = engine_luaget(L);
+	/* Look up option name */
+	unsigned opt_code = 0;
+	if (lua_isstring(L, 1)) {
+		const char *opt = lua_tostring(L, 1);
+		for (const lookup_table_t *it = query_flag_names; it->name; ++it) {
+			if (strcmp(it->name, opt) == 0) {
+				opt_code = it->id;
+				break;
+			}
+		}
+		if (!opt_code) {
+			lua_pushstring(L, "invalid option name");
+			lua_error(L);
+		}
+	}
+	/* Get or set */
+	if (lua_isboolean(L, 2) || lua_isnumber(L, 2)) {
+		if (lua_toboolean(L, 2)) {
+			engine->resolver.options |= opt_code;
+		} else {
+			engine->resolver.options &= ~opt_code; 
+		}
+	}
+	lua_pushboolean(L, engine->resolver.options & opt_code);
 	return 1;
 }
 
@@ -99,39 +214,46 @@ static void l_unpack_json(lua_State *L, JsonNode *table)
 	}
 }
 
+/** @internal Recursive Lua/JSON serialization. */
 static JsonNode *l_pack_elem(lua_State *L, int top)
 {
-	if (lua_isstring(L, top)) {
-		return json_mkstring(lua_tostring(L, top));
+	switch(lua_type(L, top)) {
+	case LUA_TSTRING:  return json_mkstring(lua_tostring(L, top));
+	case LUA_TNUMBER:  return json_mknumber(lua_tonumber(L, top));
+	case LUA_TBOOLEAN: return json_mkbool(lua_toboolean(L, top));
+	case LUA_TTABLE:   break; /* Table, iterate it. */
+	default:           return json_mknull();
 	}
-	if (lua_isnumber(L, top)) {
-		return json_mknumber(lua_tonumber(L, top));	
-	}
-	if (lua_isboolean(L, top)) {
-		return json_mkbool(lua_toboolean(L, top));	
-	}
-	return json_mknull();
-}
-
-static char *l_pack_json(lua_State *L, int top)
-{
-	JsonNode *root = json_mkobject();
-	if (!root) {
-		return NULL;
-	}
-	/* Iterate table on stack */
+	/* Use absolute indexes here, as the table may be nested. */
+	JsonNode *node = NULL;
 	lua_pushnil(L);
-	while(lua_next(L, top)) {
-		JsonNode *val = l_pack_elem(L, -1);
-		if (lua_isstring(L, -2)) {
-			json_append_member(root, lua_tostring(L, -2), val);
+	while(lua_next(L, top) != 0) {
+		JsonNode *val = l_pack_elem(L, top + 2);
+		const bool no_key = lua_isnumber(L, top + 1);
+		if (!node) {
+			node = no_key ? json_mkarray() : json_mkobject();
+			if (!node) {
+				return NULL;
+			}
+		}
+		/* Insert to array/table */
+		if (no_key) {
+			json_append_element(node, val);
 		} else {
-			json_append_element(root, val);
+			json_append_member(node, lua_tostring(L, top + 1), val);
 		}
 		lua_pop(L, 1);
 	}
-	lua_pop(L, 1);
-	/* Serialize to string */
+	return node;
+}
+
+/** @internal Serialize to string */
+static char *l_pack_json(lua_State *L, int top)
+{
+	JsonNode *root = l_pack_elem(L, top);
+	if (!root) {
+		return NULL;
+	}
 	char *result = json_encode(root);
 	json_delete(root);
 	return result;
@@ -170,7 +292,7 @@ static int l_trampoline(lua_State *L)
 			return 0;
 		}
 		JsonNode *root_node = json_decode(ret);
-		if (root_node->tag == JSON_OBJECT || root_node->tag == JSON_ARRAY) {
+		if (root_node && (root_node->tag == JSON_OBJECT || root_node->tag == JSON_ARRAY)) {
 			l_unpack_json(L, root_node);
 		} else {
 			lua_pushstring(L, ret);
@@ -202,24 +324,34 @@ void *namedb_lmdb_mkopts(const char *conf, size_t maxsize)
 static int init_resolver(struct engine *engine)
 {
 	/* Open resolution context */
+	engine->resolver.trust_anchors = map_make();
+	engine->resolver.negative_anchors = map_make();
+	engine->resolver.pool = engine->pool;
 	engine->resolver.modules = &engine->modules;
+	/* Create OPT RR */
+	engine->resolver.opt_rr = mm_alloc(engine->pool, sizeof(knot_rrset_t));
+	if (!engine->resolver.opt_rr) {
+		return kr_error(ENOMEM);
+	}
+	knot_edns_init(engine->resolver.opt_rr, KR_EDNS_PAYLOAD, 0, KR_EDNS_VERSION, engine->pool);
 	/* Set default root hints */
 	kr_zonecut_init(&engine->resolver.root_hints, (const uint8_t *)"", engine->pool);
 	kr_zonecut_set_sbelt(&engine->resolver, &engine->resolver.root_hints);
 	/* Open NS rtt + reputation cache */
-	engine->resolver.cache_rtt = malloc(lru_size(kr_nsrep_lru_t, LRU_RTT_SIZE));
+	engine->resolver.cache_rtt = mm_alloc(engine->pool, lru_size(kr_nsrep_lru_t, LRU_RTT_SIZE));
 	if (engine->resolver.cache_rtt) {
 		lru_init(engine->resolver.cache_rtt, LRU_RTT_SIZE);
 	}
-	engine->resolver.cache_rep = malloc(lru_size(kr_nsrep_lru_t, LRU_REP_SIZE));
+	engine->resolver.cache_rep = mm_alloc(engine->pool, lru_size(kr_nsrep_lru_t, LRU_REP_SIZE));
 	if (engine->resolver.cache_rep) {
 		lru_init(engine->resolver.cache_rep, LRU_REP_SIZE);
 	}
 
 	/* Load basic modules */
-	engine_register(engine, "iterate");
-	engine_register(engine, "rrcache");
-	engine_register(engine, "pktcache");
+	engine_register(engine, "iterate", NULL, NULL);
+	engine_register(engine, "validate", NULL, NULL);
+	engine_register(engine, "rrcache", NULL, NULL);
+	engine_register(engine, "pktcache", NULL, NULL);
 
 	/* Initialize storage backends */
 	struct storage_api lmdb = {
@@ -237,6 +369,7 @@ static int init_state(struct engine *engine)
 		return kr_error(ENOMEM);
 	}
 	/* Initialize used libraries. */
+	lua_gc(engine->L, LUA_GCSTOP, 0);
 	luaL_openlibs(engine->L);
 	/* Global functions */
 	lua_pushcfunction(engine->L, l_help);
@@ -245,6 +378,14 @@ static int init_state(struct engine *engine)
 	lua_setglobal(engine->L, "quit");
 	lua_pushcfunction(engine->L, l_hostname);
 	lua_setglobal(engine->L, "hostname");
+	lua_pushcfunction(engine->L, l_verbose);
+	lua_setglobal(engine->L, "verbose");
+	lua_pushcfunction(engine->L, l_option);
+	lua_setglobal(engine->L, "option");
+	lua_pushcfunction(engine->L, l_setuser);
+	lua_setglobal(engine->L, "user");
+	lua_pushcfunction(engine->L, l_libpath);
+	lua_setglobal(engine->L, "libpath");
 	lua_pushlightuserdata(engine->L, engine);
 	lua_setglobal(engine->L, "__engine");
 	return kr_ok();
@@ -267,6 +408,7 @@ int engine_init(struct engine *engine, mm_ctx_t *pool)
 	/* Initialize resolver */
 	ret = init_resolver(engine);
 	if (ret != 0) {
+		engine_deinit(engine);
 		return ret;
 	}
 	/* Initialize network */
@@ -294,25 +436,27 @@ void engine_deinit(struct engine *engine)
 		return;
 	}
 
+	/* Only close sockets and services,
+	 * no need to clean up mempool. */
 	network_deinit(&engine->net);
 	kr_zonecut_deinit(&engine->resolver.root_hints);
 	kr_cache_close(&engine->resolver.cache);
 	lru_deinit(engine->resolver.cache_rtt);
-	free(engine->resolver.cache_rtt);
 	lru_deinit(engine->resolver.cache_rep);
-	free(engine->resolver.cache_rep);
 
-	/* Unload modules. */
+	/* Unload modules and engine. */
 	for (size_t i = 0; i < engine->modules.len; ++i) {
 		engine_unload(engine, engine->modules.at[i]);
 	}
-	array_clear(engine->modules);
-	array_clear(engine->storage_registry);
-
 	if (engine->L) {
 		lua_close(engine->L);
 	}
 
+	/* Free data structures */
+	array_clear(engine->modules);
+	array_clear(engine->storage_registry);
+	kr_ta_clear(&engine->resolver.trust_anchors);
+	kr_ta_clear(&engine->resolver.negative_anchors);
 }
 
 int engine_pcall(lua_State *L, int argc)
@@ -345,8 +489,14 @@ int engine_cmd(struct engine *engine, const char *str)
 #define l_dosandboxfile(L, filename) \
 	(luaL_loadfile((L), (filename)) || engine_pcall((L), 0))
 
-static int engine_loadconf(struct engine *engine)
+static int engine_loadconf(struct engine *engine, const char *config_path)
 {
+	/* Use module path for including Lua scripts */
+	static const char l_paths[] = "package.path = package.path..';" PREFIX MODULEDIR "/?.lua'";
+	int ret = l_dobytecode(engine->L, l_paths, sizeof(l_paths) - 1, "");
+	if (ret != 0) {
+		lua_pop(engine->L, 1);
+	}
 	/* Init environment */
 	static const char sandbox_bytecode[] = {
 		#include "daemon/lua/sandbox.inc"
@@ -356,16 +506,11 @@ static int engine_loadconf(struct engine *engine)
 		lua_pop(engine->L, 1);
 		return kr_error(ENOEXEC);
 	}
-	/* Use module path for including Lua scripts */
-	int ret = engine_cmd(engine, "package.path = package.path..';" PREFIX MODULEDIR "/?.lua'");
-	if (ret > 0) {
-		lua_pop(engine->L, 1);
-	}
-
 	/* Load config file */
-	if(access("config", F_OK ) != -1 ) {
-		ret = l_dosandboxfile(engine->L, "config");
-	} else {
+	if(access(config_path, F_OK ) != -1 ) {
+		ret = l_dosandboxfile(engine->L, config_path);
+	}
+	if (ret == 0) {
 		/* Load defaults */
 		static const char config_bytecode[] = {
 			#include "daemon/lua/config.inc"
@@ -381,14 +526,20 @@ static int engine_loadconf(struct engine *engine)
 	return ret;
 }
 
-int engine_start(struct engine *engine)
+int engine_start(struct engine *engine, const char *config_path)
 {
 	/* Load configuration. */
-	int ret = engine_loadconf(engine);
+	int ret = engine_loadconf(engine, config_path);
 	if (ret != 0) {
 		return ret;
 	}
 
+	/* Clean up stack and restart GC */
+	lua_settop(engine->L, 0);
+	lua_gc(engine->L, LUA_GCCOLLECT, 0);
+	lua_gc(engine->L, LUA_GCSETSTEPMUL, 50);
+	lua_gc(engine->L, LUA_GCSETPAUSE, 400);
+	lua_gc(engine->L, LUA_GCRESTART, 0);
 	return kr_ok();
 }
 
@@ -404,7 +555,7 @@ static int register_properties(struct engine *engine, struct kr_module *module)
 	if (module->config != NULL) {
 		REGISTER_MODULE_CALL(engine->L, module, module->config, "config");
 	}
-	for (struct kr_prop *p = module->props; p->name; ++p) {
+	for (struct kr_prop *p = module->props; p && p->name; ++p) {
 		if (p->cb != NULL && p->name != NULL) {
 			REGISTER_MODULE_CALL(engine->L, module, p->cb, p->name);
 		}
@@ -421,14 +572,36 @@ static int register_properties(struct engine *engine, struct kr_module *module)
 	return kr_ok();
 }
 
-int engine_register(struct engine *engine, const char *name)
+/** @internal Find matching module */
+static size_t module_find(module_array_t *mod_list, const char *name)
+{
+	size_t found = mod_list->len;
+	for (size_t i = 0; i < mod_list->len; ++i) {
+		struct kr_module *mod = mod_list->at[i];
+		if (strcmp(mod->name, name) == 0) {
+			found = i;
+			break;
+		}
+	}
+	return found;
+}
+
+int engine_register(struct engine *engine, const char *name, const char *precedence, const char* ref)
 {
 	if (engine == NULL || name == NULL) {
 		return kr_error(EINVAL);
 	}
-
 	/* Make sure module is unloaded */
 	(void) engine_unregister(engine, name);
+	/* Find the index of referenced module. */
+	module_array_t *mod_list = &engine->modules;
+	size_t ref_pos = mod_list->len;
+	if (precedence && ref) {
+		ref_pos = module_find(mod_list, ref);
+		if (ref_pos >= mod_list->len) {
+			return kr_error(EIDRM);
+		}
+	}
 	/* Attempt to load binary module */
 	struct kr_module *module = malloc(sizeof(*module));
 	if (!module) {
@@ -444,14 +617,30 @@ int engine_register(struct engine *engine, const char *name)
 		free(module);
 		return ret;
 	}
-
 	if (array_push(engine->modules, module) < 0) {
 		engine_unload(engine, module);
 		return kr_error(ENOMEM);
 	}
+	/* Evaluate precedence operator */
+	if (precedence) {
+		struct kr_module **arr = mod_list->at;
+		size_t emplacement = mod_list->len;
+		if (strcasecmp(precedence, ">") == 0) {
+			if (ref_pos + 1 < mod_list->len)
+				emplacement = ref_pos + 1; /* Insert after target */
+		}
+		if (strcasecmp(precedence, "<") == 0) {
+			emplacement = ref_pos; /* Insert at target */
+		}
+		/* Move the tail if it has some elements. */
+		if (emplacement + 1 < mod_list->len) {
+			memmove(&arr[emplacement + 1], &arr[emplacement], sizeof(*arr) * (mod_list->len - (emplacement + 1)));
+			arr[emplacement] = module;
+		}
+	}
 
 	/* Register properties */
-	if (module->props) {
+	if (module->props || module->config) {
 		return register_properties(engine, module);
 	}
 
@@ -460,16 +649,8 @@ int engine_register(struct engine *engine, const char *name)
 
 int engine_unregister(struct engine *engine, const char *name)
 {
-	/* Find matching module. */
 	module_array_t *mod_list = &engine->modules;
-	size_t found = mod_list->len;
-	for (size_t i = 0; i < mod_list->len; ++i) {
-		struct kr_module *mod = mod_list->at[i];
-		if (strcmp(mod->name, name) == 0) {
-			found = i;
-			break;
-		}
-	}
+	size_t found = module_find(mod_list, name);
 	if (found < mod_list->len) {
 		engine_unload(engine, mod_list->at[found]);
 		array_del(*mod_list, found);

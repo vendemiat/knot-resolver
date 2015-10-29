@@ -2,6 +2,17 @@ import dns.message
 import dns.rrset
 import dns.rcode
 import dns.dnssec
+import binascii
+import socket
+import os
+import itertools
+import time
+from datetime import datetime
+
+def dprint(msg):
+    """ Verbose logging (if enabled). """
+    if 'VERBOSE' in os.environ:
+        print(msg)
 
 class Entry:
     """
@@ -19,14 +30,17 @@ class Entry:
         self.adjust_fields = ['copy_id']
         self.origin = '.'
         self.message = dns.message.Message()
-        self.message.use_edns(edns = 0)
+        self.message.use_edns(edns = 0, payload = 4096)
         self.sections = []
+        self.is_raw_data_entry = False
+        self.raw_data_pending = False
+        self.raw_data = None
 
     def match_part(self, code, msg):
         """ Compare scripted reply to given message using single criteria. """
         if code not in self.match_fields and 'all' not in self.match_fields:
             return True
-        expected = self.message
+        expected = dns.message.from_text(self.message.to_text())
         if code == 'opcode':
             return self.__compare_val(expected.opcode(), msg.opcode())
         elif code == 'qtype':
@@ -63,9 +77,22 @@ class Entry:
             match_fields = tuple(['flags'] + self.sections)
         for code in match_fields:
             try:
-                self.match_part(code, msg)
+                res = self.match_part(code, msg)
             except Exception as e:
                 raise Exception("%s: %s" % (code, str(e)))
+
+    def cmp_raw(self, raw_value):
+        if self.is_raw_data_entry is False:
+            raise Exception("entry.cmp_raw() misuse")
+        expected = None
+        if self.raw_data is not None:
+            expected = binascii.hexlify(self.raw_data)
+        got = None
+        if raw_value is not None:
+            got = binascii.hexlify(raw_value)
+        if expected != got:
+            print("expected '",expected,"', got '",got,"'")
+            raise Exception("comparsion failed")
 
     def set_match(self, fields):
         """ Set conditions for message comparison [all, flags, question, answer, authority, additional] """
@@ -77,7 +104,9 @@ class Entry:
         answer.use_edns(query.edns, query.ednsflags)
         if 'copy_id' in self.adjust_fields:
             answer.id = query.id
-            answer.question[0].name = query.question[0].name
+            # Copy letter-case if the template has QD
+            if len(answer.question) > 0:
+                answer.question[0].name = query.question[0].name
         if 'copy_query' in self.adjust_fields:
             answer.question = query.question
         return answer
@@ -103,6 +132,10 @@ class Entry:
         self.message.want_dnssec('DO' in eflags)
         self.message.set_rcode(rcode)
 
+    def begin_raw(self):
+        """ Set raw data pending flag. """
+        self.raw_data_pending = True
+
     def begin_section(self, section):
         """ Begin packet section. """
         self.section = section
@@ -110,17 +143,28 @@ class Entry:
 
     def add_record(self, owner, args):
         """ Add record to current packet section. """
-        rr = self.__rr_from_str(owner, args)
-        if self.section == 'QUESTION':
-            self.__rr_add(self.message.question, rr)
-        elif self.section == 'ANSWER':
-            self.__rr_add(self.message.answer, rr)
-        elif self.section == 'AUTHORITY':
-            self.__rr_add(self.message.authority, rr)
-        elif self.section == 'ADDITIONAL':
-            self.__rr_add(self.message.additional, rr)
+        if self.raw_data_pending is True:
+            if self.raw_data == None:
+                if owner == 'NULL':
+                    self.raw_data = None
+                else:
+                    self.raw_data = binascii.unhexlify(owner)
+            else:
+                raise Exception('raw data already set in this entry')
+            self.raw_data_pending = False
+            self.is_raw_data_entry = True
         else:
-            raise Exception('bad section %s' % self.section)
+            rr = self.__rr_from_str(owner, args)
+            if self.section == 'QUESTION':
+                self.__rr_add(self.message.question, rr)
+            elif self.section == 'ANSWER':
+                self.__rr_add(self.message.answer, rr)
+            elif self.section == 'AUTHORITY':
+                self.__rr_add(self.message.authority, rr)
+            elif self.section == 'ADDITIONAL':
+                self.__rr_add(self.message.additional, rr)
+            else:
+                raise Exception('bad section %s' % self.section)
 
     def __rr_add(self, section, rr):
     	""" Merge record to existing RRSet, or append to given section. """
@@ -227,15 +271,19 @@ class Step:
         self.args = extra_args
         self.data = []
         self.has_data = self.type not in Step.require_data
+        self.answer = None
+        self.raw_answer = None
 
     def add(self, entry):
         """ Append a data entry to this step. """
         self.data.append(entry)
 
-    def play(self, ctx):
+    def play(self, ctx, peeraddr):
         """ Play one step from a scenario. """
+        dprint('[ STEP %03d ] %s' % (self.id, self.type))
         if self.type == 'QUERY':
-            return self.__query(ctx)
+            dprint(self.data[0].message.to_text())
+            return self.__query(ctx, peeraddr)
         elif self.type == 'CHECK_OUT_QUERY':
              pass # Ignore
         elif self.type == 'CHECK_ANSWER':
@@ -251,25 +299,57 @@ class Step:
         """ Compare answer from previously resolved query. """
         if len(self.data) == 0:
             raise Exception("response definition required")
-        if ctx.last_answer is None:
-            raise Exception("no answer from preceding query")
         expected = self.data[0]
-        expected.match(ctx.last_answer)
+        if expected.is_raw_data_entry is True:
+            dprint(ctx.last_raw_answer.to_text())
+            expected.cmp_raw(ctx.last_raw_answer)
+        else:
+            if ctx.last_answer is None:
+                raise Exception("no answer from preceding query")
+            dprint(ctx.last_answer.to_text())
+            expected.match(ctx.last_answer)
 
-    def __query(self, ctx):
+    def __query(self, ctx, peeraddr):
         """ Resolve a query. """
         if len(self.data) == 0:
             raise Exception("query definition required")
-        msg = self.data[0].message
-        self.answer = ctx.resolve(msg.to_wire())
-        if self.answer is not None:
-            self.answer = dns.message.from_wire(self.answer)
-            ctx.last_answer = self.answer
+        if self.data[0].is_raw_data_entry is True:
+            data_to_wire = self.data[0].raw_data
+        else:
+            # Don't use a message copy as the EDNS data portion is not copied.
+            data_to_wire = self.data[0].message.to_wire()
+        # Send query to client and wait for response
+        while True:
+            try:
+                ctx.child_sock.send(data_to_wire)
+                break
+            except OSError, e:
+                # ENOBUFS, throttle sending
+                if e.errno == errno.ENOBUFS:
+                    time.sleep(0.1)
+        # Wait for a response for a reasonable time
+        answer = None
+        if not self.data[0].is_raw_data_entry:
+            answer, addr = ctx.child_sock.recvfrom(4096)
+        # Remember last answer for checking later
+        self.raw_answer = answer
+        ctx.last_raw_answer = answer
+        if self.raw_answer is not None:
+            self.answer = dns.message.from_wire(self.raw_answer)
+        else:
+            self.answer = None
+        ctx.last_answer = self.answer
 
     def __time_passes(self, ctx):
         """ Modify system time. """
-        ctx.scenario.time = int(self.args[1])
-        ctx.set_time(ctx.scenario.time)
+        time_file = open(os.environ["FAKETIME_TIMESTAMP_FILE"], 'r')
+        line = time_file.readline().strip()
+        time_file.close()
+        t = time.mktime(datetime.strptime(line, '%Y-%m-%d %H:%M:%S').timetuple())
+        t += int(self.args[1])
+        time_file = open(os.environ["FAKETIME_TIMESTAMP_FILE"], 'w')
+        time_file.write(datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S') + "\n")
+        time_file.close()
 
 class Scenario:
     def __init__(self, info):
@@ -278,6 +358,7 @@ class Scenario:
         self.ranges = []
         self.steps = []
         self.current_step = None
+        self.child_sock = None
 
     def reply(self, query, address = None):
         """ Attempt to find a range reply for a query. """
@@ -291,28 +372,40 @@ class Scenario:
         # Find current valid query response range
         for rng in self.ranges:
             if rng.eligible(step_id, address):
-                return rng.reply(query)
+                return (rng.reply(query), False)
         # Find any prescripted one-shot replies
         for step in self.steps:
             if step.id <= step_id or step.type != 'REPLY':
                 continue
             try:
                 candidate = step.data[0]
-                candidate.match(query)
-                step.data.remove(candidate)
-                return candidate.adjust_reply(query)
+                if candidate.is_raw_data_entry is False:
+                    candidate.match(query)
+                    step.data.remove(candidate)
+                    answer = candidate.adjust_reply(query)
+                    return (answer, False)
+                else:
+                    answer = candidate.raw_data
+                    return (answer, True)
             except:
                 pass
+        return (None, True)
 
-    def play(self, ctx):
+    def play(self, saddr, paddr):
         """ Play given scenario. """
+        self.child_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.child_sock.settimeout(2)
+        self.child_sock.connect((paddr, 53))
+
         step = None
         if len(self.steps) == 0:
             raise ('no steps in this scenario')
         try:
-            ctx.scenario = self
             for step in self.steps:
                 self.current_step = step
-                step.play(ctx)
+                step.play(self, paddr)
         except Exception as e:
             raise Exception('step #%d %s' % (step.id, str(e)))
+        finally:
+            self.child_sock.close()
+            self.child_sock = None

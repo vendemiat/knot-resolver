@@ -5,7 +5,7 @@ CMOCKA_TAG="cmocka-0.4.1"
 CMOCKA_URL="git://git.cryptomilk.org/projects/cmocka.git"
 LIBUV_TAG="v1.x"
 LIBUV_URL="https://github.com/libuv/libuv.git"
-KNOT_TAG="edc125bc"
+KNOT_TAG="v2.0.1"
 KNOT_URL="https://github.com/CZ-NIC/knot.git"
 GMP_TAG="6.0.0"
 GMP_URL="https://gmplib.org/download/gmp/gmp-${GMP_TAG}.tar.xz"
@@ -15,8 +15,10 @@ NETTLE_TAG="2.7.1"
 NETTLE_URL="https://ftp.gnu.org/gnu/nettle/nettle-${NETTLE_TAG}.tar.gz"
 GNUTLS_TAG="3.3.12"
 GNUTLS_URL="ftp://ftp.gnutls.org/gcrypt/gnutls/v3.3/gnutls-${GNUTLS_TAG}.tar.xz"
-LUA_TAG="5.2.3"
-LUA_URL="http://www.lua.org/ftp/lua-${LUA_TAG}.tar.gz"
+LUA_TAG="v2.1"
+LUA_URL="http://luajit.org/git/luajit-2.0.git"
+CWRAP_TAG="master"
+CWRAP_URL="git://git.samba.org/socket_wrapper.git"
 
 # prepare install prefix
 PREFIX=${1}; [ -z ${PREFIX} ] && export PREFIX="${HOME}/.local"
@@ -76,7 +78,7 @@ function pkg {
 }
 
 # travis-specific
-PIP_PKGS="${TRAVIS_BUILD_DIR}/tests/pydnstest/requirements.txt cpp-coveralls"
+PIP_PKGS="${TRAVIS_BUILD_DIR}/tests/pydnstest/requirements.txt cpp-coveralls Jinja2"
 if [ "${TRAVIS_OS_NAME}" == "osx" ]; then
 	DEPEND_CACHE="https://dl.dropboxusercontent.com/u/2255176/resolver-${TRAVIS_OS_NAME}-cache.tar.gz"
 	curl "${DEPEND_CACHE}" > cache.tar.gz && tar -xz -C ${HOME} -f cache.tar.gz || true
@@ -85,9 +87,11 @@ if [ "${TRAVIS_OS_NAME}" == "osx" ]; then
 	brew link --overwrite python || true
 	pip install --upgrade pip || true
 	pip install -r ${PIP_PKGS}
+	pkg cwrap ${CWRAP_URL} ${CWRAP_TAG} lib/pkgconfig/socket_wrapper.pc
 fi
 if [ "${TRAVIS_OS_NAME}" == "linux" ]; then
-	pip install --user ${USER} -r ${PIP_PKGS}
+	pkg cwrap ${CWRAP_URL} ${CWRAP_TAG} lib/pkgconfig/socket_wrapper.pc
+	pip install --user ${USER} -r ${PIP_PKGS} || true
 	rm ${HOME}/.cache/pip/log/debug.log || true
 fi
 
@@ -108,23 +112,8 @@ pkg libknot ${KNOT_URL} ${KNOT_TAG} include/libknot \
 pkg cmocka ${CMOCKA_URL} ${CMOCKA_TAG} include/cmocka.h
 # libuv
 pkg libuv ${LIBUV_URL} ${LIBUV_TAG} include/uv.h --disable-static
-# lua
-pkg lua ${LUA_URL} ${LUA_TAG} include/lua.h posix install INSTALL_TOP=${PREFIX} MYCFLAGS="-DLUA_USE_DLOPEN" MYLIBS="-ldl"
-if [ ! -f ${PREFIX}/lib/pkgconfig/lua.pc ]; then
-cat > ${PREFIX}/lib/pkgconfig/lua.pc << EOF
-prefix=${PREFIX}
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: Lua
-Description: An Extensible Extension Language
-Version: ${LUA_TAG}
-Requires:
-Libs: -L\${libdir} -llua -lm
-Cflags: -I\${includedir}
-EOF
-fi
+# luajit
+pkg lua ${LUA_URL} ${LUA_TAG} lib/pkgconfig/luajit.pc install LDFLAGS=-lm PREFIX=${PREFIX}
 
 # remove on successful build
 rm -rf ${BUILD_DIR}

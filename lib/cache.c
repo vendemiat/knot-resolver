@@ -24,27 +24,65 @@
 #include <libknot/internal/namedb/namedb_lmdb.h>
 #include <libknot/errcode.h>
 #include <libknot/descriptor.h>
+#include <libknot/dname.h>
+#include <libknot/rrtype/rrsig.h>
 
 #include "lib/cache.h"
 #include "lib/defines.h"
 #include "lib/utils.h"
 
+/* Cache version */
+#define KEY_VERSION "V\x02"
 /* Key size */
-#define KEY_HSIZE (1 + sizeof(uint16_t))
+#define KEY_HSIZE (sizeof(uint8_t) + sizeof(uint16_t))
 #define KEY_SIZE (KEY_HSIZE + KNOT_DNAME_MAXLEN)
-#define txn_api(txn) (txn->owner->api)
+#define txn_api(txn) ((txn)->owner->api)
+
+/** @internal Check cache internal data version. Clear if it doesn't match. */
+static void assert_right_version(struct kr_cache *cache)
+{
+	/* Check cache ABI version */
+	struct kr_cache_txn txn;
+	int ret = kr_cache_txn_begin(cache, &txn, 0);
+	if (ret != 0) {
+		return; /* N/A, doesn't work. */
+	}
+	namedb_val_t key = { KEY_VERSION, 2 };
+	namedb_val_t val = { NULL, 0 };
+	ret = txn_api(&txn)->find(&txn.t, &key, &val, 0);
+	if (ret == 0) { /* Version is OK */
+		kr_cache_txn_abort(&txn);
+		return;
+	}
+	/* Recreate cache and write version key */
+	ret = txn_api(&txn)->count(&txn.t);
+	if (ret > 0) { /* Non-empty cache, purge it. */
+		log_info("[cache] version mismatch, clearing\n");
+		kr_cache_clear(&txn);
+		kr_cache_txn_commit(&txn);
+		ret = kr_cache_txn_begin(cache, &txn, 0);
+	}
+	/* Either purged or empty. */
+	if (ret == 0) {
+		txn_api(&txn)->insert(&txn.t, &key, &val, 0);
+		kr_cache_txn_commit(&txn);
+	}
+}
 
 int kr_cache_open(struct kr_cache *cache, const namedb_api_t *api, void *opts, mm_ctx_t *mm)
 {
 	if (!cache) {
 		return kr_error(EINVAL);
 	}
+	/* Open cache */
 	cache->api = (api == NULL) ? namedb_lmdb_api() : api;
 	int ret = cache->api->init(&cache->db, mm, opts);
 	if (ret != 0) {
 		return ret;
 	}
 	memset(&cache->stats, 0, sizeof(cache->stats));
+	/* Check cache ABI version */
+	assert_right_version(cache);
 	return kr_ok();
 }
 
@@ -99,23 +137,26 @@ void kr_cache_txn_abort(struct kr_cache_txn *txn)
 	}
 }
 
-/** @internal Composed key as { u8 tag, u8[1-255] name, u16 type } */
+/**
+ * @internal Composed key as { u8 tag, u8[1-255] name, u16 type }
+ * The name is lowercased and label order is reverted for easy prefix search.
+ * e.g. '\x03nic\x02cz\x00' is saved as '\0x00cz\x00nic\x00'
+ */
 static size_t cache_key(uint8_t *buf, uint8_t tag, const knot_dname_t *name, uint16_t rrtype)
 {
-	/* Write tag + type */
-	buf[0] = tag;
-	memcpy(buf + 1, &rrtype, sizeof(uint16_t));
-	buf += KEY_HSIZE;
-	/* Write lowercased name */
-	int ret = knot_dname_to_wire(buf, name, KNOT_DNAME_MAXLEN);
-	if (ret <= 0) {
+	/* Convert to lookup format */
+	int ret = knot_dname_lf(buf, name, NULL);
+	if (ret != 0) {
 		return 0;
 	}
-	knot_dname_to_lower(buf);
-	return KEY_HSIZE + ret;
+	/* Write tag + type */
+	uint8_t name_len = buf[0];
+	buf[0] = tag;
+	memcpy(buf + sizeof(uint8_t) + name_len, &rrtype, sizeof(uint16_t));
+	return name_len + KEY_HSIZE;
 }
 
-static struct kr_cache_entry *cache_entry(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type)
+static struct kr_cache_entry *lookup(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type)
 {
 	uint8_t keybuf[KEY_SIZE];
 	size_t key_len = cache_key(keybuf, tag, name, type);
@@ -134,6 +175,26 @@ static struct kr_cache_entry *cache_entry(struct kr_cache_txn *txn, uint8_t tag,
 	return (struct kr_cache_entry *)val.data;
 }
 
+static int check_lifetime(struct kr_cache_entry *found, uint32_t *timestamp)
+{
+	/* No time constraint */
+	if (!timestamp) {
+		return kr_ok();
+	} else if (*timestamp <= found->timestamp) {
+		/* John Connor record cached in the future. */
+		*timestamp = 0;
+		return kr_ok();
+	} else {
+		/* Check if the record is still valid. */
+		uint32_t drift = *timestamp - found->timestamp;
+		if (drift <= found->ttl) {
+			*timestamp = drift;
+			return kr_ok();
+		}
+	}
+	return kr_error(ESTALE);
+}
+
 int kr_cache_peek(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type,
                   struct kr_cache_entry **entry, uint32_t *timestamp)
 {
@@ -141,34 +202,21 @@ int kr_cache_peek(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *nam
 		return kr_error(EINVAL);
 	}
 
-	struct kr_cache_entry *found = cache_entry(txn, tag, name, type);
+	struct kr_cache_entry *found = lookup(txn, tag, name, type);
 	if (!found) {
 		txn->owner->stats.miss += 1;
 		return kr_error(ENOENT);
-	}	
-
-	/* No time constraint */
-	*entry = found;
-	if (!timestamp) {
-		txn->owner->stats.hit += 1;
-		return kr_ok();
-	} else if (*timestamp <= found->timestamp) {
-		/* John Connor record cached in the future. */
-		*timestamp = 0;
-		txn->owner->stats.hit += 1;
-		return kr_ok();
-	} else {
-		/* Check if the record is still valid. */
-		uint32_t drift = *timestamp - found->timestamp;
-		if (drift <= found->ttl) {
-			*timestamp = drift;
-			txn->owner->stats.hit += 1;
-			return kr_ok();
-		}
 	}
 
-	txn->owner->stats.miss += 1;
-	return kr_error(ESTALE);
+	/* Check entry lifetime */
+	*entry = found;
+	int ret = check_lifetime(found, timestamp);
+	if (ret == 0) {
+		txn->owner->stats.hit += 1;
+	} else {
+		txn->owner->stats.miss += 1;
+	}
+	return ret;
 }
 
 static void entry_write(struct kr_cache_entry *dst, struct kr_cache_entry *header, namedb_val_t data)
@@ -245,7 +293,7 @@ int kr_cache_clear(struct kr_cache_txn *txn)
 	return txn_api(txn)->clear(&txn->t);
 }
 
-int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint32_t *timestamp)
+int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank, uint32_t *timestamp)
 {
 	if (!txn || !rr || !timestamp) {
 		return kr_error(EINVAL);
@@ -257,9 +305,24 @@ int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint32_t *times
 	if (ret != 0) {
 		return ret;
 	}
+	if (rank) {
+		*rank = entry->rank;
+	}
 	rr->rrs.rr_count = entry->count;
 	rr->rrs.data = entry->data;
 	return kr_ok();
+}
+
+int kr_cache_peek_rank(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type, uint32_t timestamp)
+{
+	struct kr_cache_entry *found = lookup(txn, tag, name, type);
+	if (!found) {
+		return kr_error(ENOENT);
+	}
+	if (check_lifetime(found, &timestamp) != 0) {
+		return kr_error(ESTALE);
+	}
+	return found->rank;
 }
 
 int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t drift, mm_ctx_t *mm)
@@ -296,7 +359,7 @@ int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t dr
 	return kr_ok();
 }
 
-int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint32_t timestamp)
+int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_t rank, uint32_t timestamp)
 {
 	if (!txn || !rr) {
 		return kr_error(EINVAL);
@@ -311,6 +374,7 @@ int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint32_
 	struct kr_cache_entry header = {
 		.timestamp = timestamp,
 		.ttl = 0,
+		.rank = rank,
 		.count = rr->rrs.rr_count
 	};
 	knot_rdata_t *rd = rr->rrs.data;
@@ -323,4 +387,55 @@ int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint32_
 
 	namedb_val_t data = { rr->rrs.data, knot_rdataset_size(&rr->rrs) };
 	return kr_cache_insert(txn, KR_CACHE_RR, rr->owner, rr->type, &header, data);
+}
+
+int kr_cache_peek_rrsig(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank, uint32_t *timestamp)
+{
+	if (!txn || !rr || !timestamp) {
+		return kr_error(EINVAL);
+	}
+
+	/* Check if the RRSet is in the cache. */
+	struct kr_cache_entry *entry = NULL;
+	int ret = kr_cache_peek(txn, KR_CACHE_SIG, rr->owner, rr->type, &entry, timestamp);
+	if (ret != 0) {
+		return ret;
+	}
+	if (rank) {
+		*rank = entry->rank;
+	}
+	rr->type = KNOT_RRTYPE_RRSIG;
+	rr->rrs.rr_count = entry->count;
+	rr->rrs.data = entry->data;
+	return kr_ok();
+}
+
+int kr_cache_insert_rrsig(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_t rank, uint32_t timestamp)
+{
+	if (!txn || !rr) {
+		return kr_error(EINVAL);
+	}
+
+	/* Ignore empty records */
+	if (knot_rrset_empty(rr)) {
+		return kr_ok();
+	}
+
+	/* Prepare header to write */
+	struct kr_cache_entry header = {
+		.timestamp = timestamp,
+		.ttl = 0,
+		.rank = rank,
+		.count = rr->rrs.rr_count
+	};
+	for (uint16_t i = 0; i < rr->rrs.rr_count; ++i) {
+		knot_rdata_t *rd = knot_rdataset_at(&rr->rrs, i);
+		if (knot_rdata_ttl(rd) > header.ttl) {
+			header.ttl = knot_rdata_ttl(rd);
+		}
+	}
+
+	uint16_t covered = knot_rrsig_type_covered(&rr->rrs, 0);
+	namedb_val_t data = { rr->rrs.data, knot_rdataset_size(&rr->rrs) };
+	return kr_cache_insert(txn, KR_CACHE_SIG, rr->owner, covered, &header, data);
 }

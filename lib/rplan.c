@@ -119,16 +119,17 @@ struct kr_query *kr_rplan_push(struct kr_rplan *rplan, struct kr_query *parent,
 	qry->stype = type;
 	qry->flags = rplan->request->options;
 	qry->parent = parent;
+	qry->ns.addr[0].ip.sa_family = AF_UNSPEC;
 	gettimeofday(&qry->timestamp, NULL);
 	add_tail(&rplan->pending, &qry->node);
 	kr_zonecut_init(&qry->zone_cut, (const uint8_t *)"", rplan->pool);
 
-#ifndef NDEBUG
+	WITH_DEBUG {
 	char name_str[KNOT_DNAME_MAXLEN], type_str[16];
 	knot_dname_to_str(name_str, name, sizeof(name_str));
 	knot_rrtype_to_string(type, type_str, sizeof(type_str));
 	DEBUG_MSG(parent, "plan '%s' type '%s'\n", name_str, type_str);
-#endif
+	}
 	return qry;
 }
 
@@ -143,15 +144,6 @@ int kr_rplan_pop(struct kr_rplan *rplan, struct kr_query *qry)
 	return KNOT_EOK;
 }
 
-struct kr_query *kr_rplan_current(struct kr_rplan *rplan)
-{
-	if (kr_rplan_empty(rplan)) {
-		return NULL;
-	}
-
-	return TAIL(rplan->pending);
-}
-
 bool kr_rplan_satisfies(struct kr_query *closure, const knot_dname_t *name, uint16_t cls, uint16_t type)
 {
 	while (closure != NULL) {
@@ -161,4 +153,20 @@ bool kr_rplan_satisfies(struct kr_query *closure, const knot_dname_t *name, uint
 		closure = closure->parent;
 	}
 	return false;
+}
+
+struct kr_query *kr_rplan_resolved(struct kr_rplan *rplan)
+{
+	if (EMPTY_LIST(rplan->resolved)) {
+		return NULL;
+	}
+	return TAIL(rplan->resolved);
+}
+
+struct kr_query *kr_rplan_next(struct kr_query *qry)
+{
+	if (!qry) {
+		return NULL;
+	}
+	return (struct kr_query *)qry->node.prev; /* The lists are used as stack, TOP is the TAIL. */
 }

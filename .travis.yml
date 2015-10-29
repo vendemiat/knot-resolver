@@ -15,13 +15,16 @@ notifications:
         on_failure: always
 env:
     global:
+        - secure: "OfAd7YOX7AETqcqtHB0tMeMWOF8GgjEcqd+AVSj4ZPc/WqWQc9nqpch39ApadHf6kXfSXAlhHhIvQmDwLUoPORq7FAk37VIF2aNBCHBJ+H5S18VEiKdPM1f4fJYlq8akgpR1K7jbzpckht86g1BrzlEzCj8zXrnlRrHOPYEzpWk="
         - PKG_CONFIG_PATH="${HOME}/.local/lib/pkgconfig"
         - PATH="${HOME}/.local/bin:/usr/local/bin:${PATH}"
-        - CFLAGS="${CFLAGS} -O0 -g -fPIC -DNDEBUG"
+        - CFLAGS="${CFLAGS} -O0 -g -fPIC"
         - LD_LIBRARY_PATH="${HOME}/.local/lib"
-        - secure: "OfAd7YOX7AETqcqtHB0tMeMWOF8GgjEcqd+AVSj4ZPc/WqWQc9nqpch39ApadHf6kXfSXAlhHhIvQmDwLUoPORq7FAk37VIF2aNBCHBJ+H5S18VEiKdPM1f4fJYlq8akgpR1K7jbzpckht86g1BrzlEzCj8zXrnlRrHOPYEzpWk="
+        - DYLD_LIBRARY_PATH="${HOME}/.local/lib"
+        - SOCKET_WRAPPER_DIR="${HOME}/test-dir"
 before_script:
     - ./scripts/bootstrap-depends.sh ${HOME}/.local
+    - mkdir ${SOCKET_WRAPPER_DIR}
 script:
     - make
 sudo: false
@@ -29,7 +32,6 @@ cache:
     directories:
     - ${HOME}/.local
     - ${HOME}/.cache/pip
-
 addons:
   coverity_scan:
     project:

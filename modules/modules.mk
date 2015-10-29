@@ -16,13 +16,17 @@ endif
 ifeq ($(HAS_lua),yes)
 modules_TARGETS += ketcd \
                    graphite \
-                   block \
-                   predict
+                   policy \
+                   view \
+                   predict \
+                   dns64
 endif
 
 # List of Golang modules
-ifeq ($(HAS_gccgo),yes)
-modules_TARGETS += gostats
+ifeq ($(HAS_go),yes)
+ifeq ($(HAS_geoip),yes)
+modules_TARGETS += tinyweb
+endif
 endif
 
 # Make C module
@@ -53,21 +57,21 @@ endef
 # Go target definition
 define go_target 
 $(1) := $(2)/$(1)$(LIBEXT)
-$(1)_OBJS := $(addprefix $(2)/_obj/,_cgo_defun.c _cgo_export.c $(subst /,_,$(2))_$(1).cgo2.c)
-$(1)_GOBJS := $(addprefix $(2)/_obj/,_cgo_gotypes.go $(subst /,_,$(2))_$(1).cgo1.go)
-$(2)/_obj/_cgo_export.h: $$($(1)_SOURCES)
-	@$(INSTALL) -d $(2)/_obj
-	$(call quiet,CGO,$$^) -gccgo=true -objdir=$(2)/_obj -- $(CFLAGS) $$^
-$(2)/$(1).o: $(2)/_obj/_cgo_export.h
-	$(call quiet,GCCGO,$$@) -I$(2)/_obj -c -fPIC $$($(1)_GOBJS) -o $$@
-$(2)/$(1)$(LIBEXT): $(2)/$(1).o $$($(1)_DEPEND)
-	$(call quiet,GCCGO,$$@) -g -fPIC $(CFLAGS) -I$(2)/_obj $(2)/$(1).o $$($(1)_OBJS) -o $$@ -$(LIBTYPE) -lgcc -lgo $$($(1)_LIBS)
+$(2)/$(1)$(LIBEXT): $$($(1)_SOURCES) $$($(1)_DEPEND)
+	@echo "  GO	$(2)"; CGO_CFLAGS="$(BUILD_CFLAGS)" CGO_LDFLAGS="$$($(1)_LIBS)" $(GO) build -buildmode=c-shared -o $$@ $$($(1)_SOURCES)
 $(1)-clean:
-	$(RM) -r $(2)/_obj $(2)/$(1)$(LIBEXT)
-$(1)-install: $(2)/$(1)$(LIBEXT)
+	$(RM) -r $(2)/$(1).h $(2)/$(1)$(LIBEXT)
+ifeq ($$(strip $$($(1)_INSTALL)),)
+$(1)-dist:
 	$(INSTALL) -d $(PREFIX)/$(MODULEDIR)
-	$(INSTALL) $$^ $(PREFIX)/$(MODULEDIR)
-.PHONY: $(1)-clean $(1)-install
+else
+$(1)-dist: $$($(1)_INSTALL)
+	$(INSTALL) -d $(PREFIX)/$(MODULEDIR)/$(1)
+	$(INSTALL) $$^ $(PREFIX)/$(MODULEDIR)/$(1)
+endif
+$(1)-install: $(2)/$(1)$(LIBEXT) $(1)-dist
+	$(INSTALL) $(2)/$(1)$(LIBEXT) $(PREFIX)/$(MODULEDIR)
+.PHONY: $(1)-clean $(1)-install $(1)-dist
 endef
 
 # Include modules

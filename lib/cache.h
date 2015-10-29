@@ -23,8 +23,24 @@
 enum kr_cache_tag {
 	KR_CACHE_RR   = 'R',
 	KR_CACHE_PKT  = 'P',
-	KR_CACHE_SEC  = 'S',
+	KR_CACHE_SIG  = 'G',
 	KR_CACHE_USER = 0x80
+};
+
+/**
+ * Cache entry rank.
+ * @note Be careful about chosen cache rank nominal values.
+ * - AUTH must be > than NONAUTH
+ * - AUTH INSECURE must be > than AUTH (because it attempted validation)
+ * - NONAUTH SECURE must be > than AUTH (because it's valid)
+ */
+enum kr_cache_rank {
+	KR_RANK_BAD       = 0,  /* BAD cache, do not use. */ 
+	KR_RANK_INSECURE  = 1,  /* Entry is DNSSEC insecure (e.g. RRSIG not exists). */
+	KR_RANK_NONAUTH   = 8,  /* Entry from authority section (i.e. parent-side) */
+	KR_RANK_AUTH      = 16, /* Entry from answer (authoritative data) */
+	KR_RANK_SECURE    = 64, /* Entry is DNSSEC valid (e.g. RRSIG exists). */
+	/* @note Rank must not exceed 6 bits */
 };
 
 /**
@@ -35,6 +51,7 @@ struct kr_cache_entry
 	uint32_t timestamp;
 	uint32_t ttl;
 	uint16_t count;
+	uint16_t rank;
 	uint8_t  data[];
 };
 
@@ -115,6 +132,8 @@ void kr_cache_txn_abort(struct kr_cache_txn *txn);
 int kr_cache_peek(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type,
                   struct kr_cache_entry **entry, uint32_t *timestamp);
 
+
+
 /**
  * Insert asset into cache, replacing any existing data.
  * @param txn transaction instance
@@ -146,14 +165,26 @@ int kr_cache_remove(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *n
 int kr_cache_clear(struct kr_cache_txn *txn);
 
 /**
+ * Peek the cache for given key and retrieve it's rank.
+ * @param txn transaction instance
+ * @param tag asset tag
+ * @param name asset name
+ * @param type record type
+ * @param timestamp current time
+ * @return rank (0 or positive), or an error (negative number)
+ */
+int kr_cache_peek_rank(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type, uint32_t timestamp);
+
+/**
  * Peek the cache for given RRSet (name, type)
  * @note The 'drift' is the time passed between the cache time of the RRSet and now (in seconds).
  * @param txn transaction instance
  * @param rr query RRSet (its rdataset may be changed depending on the result)
+ * @param rank entry rank will be stored in this variable
  * @param timestamp current time (will be replaced with drift if successful)
  * @return 0 or an errcode
  */
-int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint32_t *timestamp);
+int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank, uint32_t *timestamp);
 
 /**
  * Clone read-only RRSet and adjust TTLs.
@@ -169,7 +200,30 @@ int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t dr
  * Insert RRSet into cache, replacing any existing data.
  * @param txn transaction instance
  * @param rr inserted RRSet
+ * @param rank rank of the data
  * @param timestamp current time
  * @return 0 or an errcode
  */
-int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint32_t timestamp);
+int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_t rank, uint32_t timestamp);
+
+/**
+ * Peek the cache for the given RRset signature (name, type)
+ * @note The RRset type must not be RRSIG but instead it must equal the type covered field of the sought RRSIG.
+ * @param txn transaction instance
+ * @param rr query RRSET (its rdataset and type may be changed depending on the result)
+ * @param rank entry rank will be stored in this variable
+ * @param timestamp current time (will be replaced with drift if successful)
+ * @return 0 or an errcode
+ */
+int kr_cache_peek_rrsig(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank, uint32_t *timestamp);
+
+/**
+ * Insert the selected RRSIG RRSet of the selected type covered into cache, replacing any existing data.
+ * @note The RRSet must contain RRSIGS with only the specified type covered.
+ * @param txn transaction instance
+ * @param rr inserted RRSIG RRSet
+ * @param rank rank of the data
+ * @param timestamp current time
+ * @return 0 or an errcode
+ */
+int kr_cache_insert_rrsig(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_t rank, uint32_t timestamp);

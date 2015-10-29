@@ -20,6 +20,7 @@
 #include <libknot/processing/layer.h>
 #include <libknot/packet/pkt.h>
 
+#include "lib/generic/map.h"
 #include "lib/generic/array.h"
 #include "lib/nsrep.h"
 #include "lib/rplan.h"
@@ -28,31 +29,8 @@
 
 /**
  * @file resolve.h
- * @brief The API provides a high-level API for simple name resolution,
- * and an API providing a "consumer-producer"-like interface to enable
- * you write custom I/O or special iterative resolution driver.
- *
- * # Example usage of the high-level API:
- *
- * @code{.c}
- *
- * struct kr_context ctx = {
- *     .pool = NULL, // for persistent data
- *     .cache = ..., // open cache instance (or NULL)
- *     .layers = {}  // loaded layers
- * };
- *
- * // Push basic layers
- * array_push(ctx.layers, iterate_layer);
- * array_push(ctx.layers, rrcache_layer);
- *
- * // Resolve "IN A cz."
- * knot_pkt_t *answer = knot_pkt_new(NULL, 65535, ctx.pool);
- * int ret = kr_resolve(&ctx, answer, (uint8_t*)"\x02cz", 1, 1);
- * printf("rcode: %d, ancount: %u\n",
- *        knot_wire_get_rcode(answer->wire),
- *        knot_wire_get_ancount(answer->wire));
- * @endcode
+ * @brief The API provides an API providing a "consumer-producer"-like interface to enable
+ * user to plug it into existing event loop or I/O code.
  *
  * # Example usage of the iterative API:
  *
@@ -65,8 +43,10 @@
  * 		.alloc = (mm_alloc_t) mp_alloc
  * 	}
  * };
- * kr_resolve_begin(&req, ctx, answer);
- * int state = kr_resolve_query(&req, qname, qclass, qtype);
+ *
+ * // Setup and provide input query
+ * int state = kr_resolve_begin(&req, ctx, final_answer);
+ * state = kr_resolve_consume(&req, query);
  *
  * // Generate answer
  * while (state == KNOT_STATE_PRODUCE) {
@@ -77,7 +57,7 @@
  *         int ret = sendrecv(addr, proto, query, resp);
  *
  *         // If I/O fails, make "resp" empty
- *         state = kr_resolve_consume(&request, resp);
+ *         state = kr_resolve_consume(&request, addr, resp);
  *         knot_pkt_clear(resp);
  *     }
  *     knot_pkt_clear(query);
@@ -102,14 +82,17 @@ typedef array_t(struct kr_module *) module_array_t;
  *       be shared between threads.
  */
 struct kr_context
-{
-	mm_ctx_t *pool;
+{	
+	uint32_t options;
+	knot_rrset_t *opt_rr;
+	map_t trust_anchors;
+	map_t negative_anchors;
 	struct kr_zonecut root_hints;
 	struct kr_cache cache;
 	kr_nsrep_lru_t *cache_rtt;
 	kr_nsrep_lru_t *cache_rep;
 	module_array_t *modules;
-	uint32_t options;
+	mm_ctx_t *pool;
 };
 
 /**
@@ -124,27 +107,19 @@ struct kr_context
  */
 struct kr_request {
     struct kr_context *ctx;
-    struct kr_rplan rplan;
     knot_pkt_t *answer;
-    mm_ctx_t pool;
+    struct kr_query *current_query;    /**< Current evaluated query. */
+    struct {
+        const knot_rrset_t *key;
+        const struct sockaddr *addr;
+    } qsource;
     uint32_t options;
     int state;
+    rr_array_t authority;
+    rr_array_t additional;
+    struct kr_rplan rplan;
+    mm_ctx_t pool;
 };
-
-/**
- * Resolve an input query and produce a packet with an answer.
- *
- * @note The function doesn't change the packet question or message ID.
- *
- * @param ctx    resolution context
- * @param answer answer packet to be written
- * @param qname  resolved query name
- * @param qclass resolved query class
- * @param qtype  resolved query type
- * @return       0 or an error code
- */
-int kr_resolve(struct kr_context* ctx, knot_pkt_t *answer,
-               const knot_dname_t *qname, uint16_t qclass, uint16_t qtype);
 
 /**
  * Begin name resolution.
@@ -160,25 +135,16 @@ int kr_resolve(struct kr_context* ctx, knot_pkt_t *answer,
 int kr_resolve_begin(struct kr_request *request, struct kr_context *ctx, knot_pkt_t *answer);
 
 /**
- * Push new query for resolution to the state.
- * @param  request request state (if already has a question, this will be resolved first)
- * @param  qname
- * @param  qclass
- * @param  qtype
- * @return         PRODUCE|FAIL
- */
-int kr_resolve_query(struct kr_request *request, const knot_dname_t *qname, uint16_t qclass, uint16_t qtype);
-
-/**
  * Consume input packet (may be either first query or answer to query originated from kr_resolve_produce())
  *
  * @note If the I/O fails, provide an empty or NULL packet, this will make iterator recognize nameserver failure.
  * 
  * @param  request request state (awaiting input)
+ * @param  src     [in] packet source address
  * @param  packet  [in] input packet
  * @return         any state
  */
-int kr_resolve_consume(struct kr_request *request, knot_pkt_t *packet);
+int kr_resolve_consume(struct kr_request *request, const struct sockaddr *src, knot_pkt_t *packet);
 
 /**
  * Produce either next additional query or finish.
@@ -206,3 +172,18 @@ int kr_resolve_produce(struct kr_request *request, struct sockaddr **dst, int *t
  * @return         DONE
  */
 int kr_resolve_finish(struct kr_request *request, int state);
+
+/**
+ * Return resolution plan.
+ * @param  request request state
+ * @return         pointer to rplan
+ */
+struct kr_rplan *kr_resolve_plan(struct kr_request *request);
+
+/**
+ * Return memory pool associated with request.
+ * @param  request request state
+ * @return         mempool
+ */
+mm_ctx_t *kr_resolve_pool(struct kr_request *request);
+

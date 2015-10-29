@@ -17,16 +17,27 @@
 #pragma once
 
 #include "lib/defines.h"
+#include "lib/utils.h"
 #include "lib/resolve.h"
 
 #ifndef NDEBUG
-/** @internal Print a debug message related to resolution. */
+ /** @internal Print a debug message related to resolution. */
  #define QRDEBUG(query, cls, fmt, ...) do { \
     unsigned _ind = 0; \
     for (struct kr_query *q = (query); q; q = q->parent, _ind += 2); \
-    fprintf(stdout, "[%s] %*s" fmt, cls, _ind, "", ##  __VA_ARGS__); \
-    fflush(stdout); \
+    log_debug("[%s] %*s" fmt, cls, _ind, "", ##  __VA_ARGS__); \
     } while (0)
 #else
  #define QRDEBUG(query, cls, fmt, ...)
 #endif
+
+/** Pickled layer state (api, input, state). */
+struct kr_layer_pickle {
+    struct kr_layer_pickle *next;
+    const struct knot_layer_api *api;
+    knot_pkt_t *pkt;
+    unsigned state;
+};
+
+/* Repurpose layer states. */
+#define KNOT_STATE_YIELD KNOT_STATE_NOOP

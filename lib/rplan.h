@@ -27,17 +27,23 @@
 #include "lib/nsrep.h"
 
 #define QUERY_FLAGS(X) \
-	X(NO_MINIMIZE, 1 << 0) /**< Don't minimize QNAME. */ \
-	X(NO_THROTTLE, 1 << 1) /**< No query/slow NS throttling. */ \
-	X(TCP        , 1 << 2) /**< Use TCP for this query. */ \
-	X(RESOLVED   , 1 << 3) /**< Query is resolved. */ \
-	X(AWAIT_IPV4 , 1 << 4) /**< Query is waiting for A address. */ \
-	X(AWAIT_IPV6 , 1 << 5) /**< Query is waiting for AAAA address. */ \
-	X(AWAIT_CUT  , 1 << 6) /**< Query is waiting for zone cut lookup */ \
-	X(SAFEMODE   , 1 << 7) /**< Don't use fancy stuff (EDNS...) */ \
-	X(CACHED     , 1 << 8) /**< Query response is cached. */ \
-	X(EXPIRING   , 1 << 9) /**< Query response is cached, but expiring. */ \
-	X(NO_EXPIRING, 1 << 10) /**< Do not use expiring cached records. */ \
+	X(NO_MINIMIZE,     1 << 0) /**< Don't minimize QNAME. */ \
+	X(NO_THROTTLE,     1 << 1) /**< No query/slow NS throttling. */ \
+	X(NO_IPV6,         1 << 2) /**< Disable IPv6 */ \
+	X(NO_IPV4,         1 << 3) /**< Disable IPv4 */ \
+	X(TCP,             1 << 4) /**< Use TCP for this query. */ \
+	X(RESOLVED,        1 << 5) /**< Query is resolved. */ \
+	X(AWAIT_IPV4,      1 << 6) /**< Query is waiting for A address. */ \
+	X(AWAIT_IPV6,      1 << 7) /**< Query is waiting for AAAA address. */ \
+	X(AWAIT_CUT,       1 << 8) /**< Query is waiting for zone cut lookup */ \
+	X(SAFEMODE,        1 << 9) /**< Don't use fancy stuff (EDNS...) */ \
+	X(CACHED,          1 << 10) /**< Query response is cached. */ \
+	X(NO_CACHE,        1 << 11) /**< Do not use expiring cache for lookup. */ \
+	X(EXPIRING,        1 << 12) /**< Query response is cached, but expiring. */ \
+	X(ALLOW_LOCAL,     1 << 13) /**< Allow queries to local or private address ranges. */ \
+	X(DNSSEC_WANT,     1 << 14) /**< Want DNSSEC secured answer. */ \
+	X(DNSSEC_BOGUS,    1 << 15) /**< Query response is DNSSEC bogus. */ \
+	X(DNSSEC_INSECURE, 1 << 16) /**< Query response is DNSSEC insecure. */ \
 
 /** Query flags */
 enum kr_query_flag {
@@ -55,15 +61,16 @@ extern const lookup_table_t query_flag_names[];
 struct kr_query {
 	node_t node;
 	struct kr_query *parent;
-	struct kr_nsrep ns;
-	struct kr_zonecut zone_cut;
-	struct timeval timestamp;
 	knot_dname_t *sname;
 	uint16_t stype;
 	uint16_t sclass;
 	uint16_t id;
-	uint16_t flags;
-	unsigned secret;
+	uint32_t flags;
+	uint32_t secret;
+	struct timeval timestamp;
+	struct kr_nsrep ns;
+	struct kr_zonecut zone_cut;
+	struct kr_layer_pickle *deferred;
 };
 
 /**
@@ -119,18 +126,17 @@ struct kr_query *kr_rplan_push(struct kr_rplan *rplan, struct kr_query *parent,
  * @note Popped queries are not discarded, but moved to the resolved list.
  * @param rplan plan instance
  * @param qry resolved query
- * @return KNOT_E*
+ * @return 0 or an error
  */
 int kr_rplan_pop(struct kr_rplan *rplan, struct kr_query *qry);
-
-/**
- * Currently resolved query (at the top).
- * @param rplan plan instance
- * @return query instance or NULL if empty
- */
-struct kr_query *kr_rplan_current(struct kr_rplan *rplan);
 
 /**
  * Return true if resolution chain satisfies given query.
  */
 bool kr_rplan_satisfies(struct kr_query *closure, const knot_dname_t *name, uint16_t cls, uint16_t type);
+
+/** Return last resolved query. */
+struct kr_query *kr_rplan_resolved(struct kr_rplan *rplan);
+
+/** Return query predecessor. */
+struct kr_query *kr_rplan_next(struct kr_query *qry);

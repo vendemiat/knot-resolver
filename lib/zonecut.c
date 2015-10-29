@@ -29,28 +29,44 @@
 /* Root hint descriptor. */
 struct hint_info {
 	const knot_dname_t *name;
+	size_t len;
 	const uint8_t *addr;
 };
 
 /* Initialize with SBELT name servers. */
 #define U8(x) (const uint8_t *)(x)
-#define HINT_COUNT 13
-#define HINT_ADDRLEN sizeof(struct in_addr)
+#define I4 sizeof(struct in_addr)
+#define I6 sizeof(struct in6_addr)
+#define HINT_COUNT 24
 static const struct hint_info SBELT[HINT_COUNT] = {
-        { U8("\x01""a""\x0c""root-servers""\x03""net"), U8("\xc6)\x00\x04")    }, /* 198.41.0.4 */
-        { U8("\x01""b""\x0c""root-servers""\x03""net"), U8("\xc0\xe4O\xc9")    }, /* 192.228.79.201 */
-        { U8("\x01""c""\x0c""root-servers""\x03""net"), U8("\xc6)\x00\x04")    }, /* 192.33.4.12 */
-        { U8("\x01""d""\x0c""root-servers""\x03""net"), U8("\xc7\x07[\r")      }, /* 199.7.91.13 */
-        { U8("\x01""e""\x0c""root-servers""\x03""net"), U8("\xc0\xcb\xe6\n")   }, /* 192.203.230.10 */
-        { U8("\x01""f""\x0c""root-servers""\x03""net"), U8("\xc0\x05\x05\xf1") }, /* 192.5.5.241 */
-        { U8("\x01""g""\x0c""root-servers""\x03""net"), U8("\xc0p$\x04")       }, /* 192.112.36.4 */
-        { U8("\x01""h""\x0c""root-servers""\x03""net"), U8("\x80?\x025")       }, /* 128.63.2.53 */
-        { U8("\x01""i""\x0c""root-servers""\x03""net"), U8("\xc0$\x94\x11")    }, /* 192.36.148.17 */
-        { U8("\x01""j""\x0c""root-servers""\x03""net"), U8("\xc0:\x80\x1e")    }, /* 192.58.128.30 */
-        { U8("\x01""k""\x0c""root-servers""\x03""net"), U8("\xc1\x00\x0e\x81") }, /* 193.0.14.129 */
-        { U8("\x01""l""\x0c""root-servers""\x03""net"), U8("\xc7\x07S*")       }, /* 199.7.83.42 */
-        { U8("\x01""m""\x0c""root-servers""\x03""net"), U8("\xca\x0c\x1b!")    }, /* 202.12.27.33 */
+        { U8("\x01""j""\x0c""root-servers""\x03""net"), I4, U8("\xc0:\x80\x1e")    }, /* 192.58.128.30 */
+        { U8("\x01""k""\x0c""root-servers""\x03""net"), I4, U8("\xc1\x00\x0e\x81") }, /* 193.0.14.129 */
+        { U8("\x01""d""\x0c""root-servers""\x03""net"), I4, U8("\xc7\x07[\r")      }, /* 199.7.91.13 */
+        { U8("\x01""e""\x0c""root-servers""\x03""net"), I4, U8("\xc0\xcb\xe6\n")   }, /* 192.203.230.10 */
+        { U8("\x01""f""\x0c""root-servers""\x03""net"), I4, U8("\xc0\x05\x05\xf1") }, /* 192.5.5.241 */
+        { U8("\x01""g""\x0c""root-servers""\x03""net"), I4, U8("\xc0p$\x04")       }, /* 192.112.36.4 */
+        { U8("\x01""h""\x0c""root-servers""\x03""net"), I4, U8("\xc6\x61\xbe\x35") }, /* 198.97.190.53 */
+        { U8("\x01""i""\x0c""root-servers""\x03""net"), I4, U8("\xc0$\x94\x11")    }, /* 192.36.148.17 */
+        { U8("\x01""l""\x0c""root-servers""\x03""net"), I4, U8("\xc7\x07S*")       }, /* 199.7.83.42 */
+        { U8("\x01""m""\x0c""root-servers""\x03""net"), I4, U8("\xca\x0c\x1b!")    }, /* 202.12.27.33 */
+        { U8("\x01""b""\x0c""root-servers""\x03""net"), I4, U8("\xc0\xe4O\xc9")    }, /* 192.228.79.201 */
+        { U8("\x01""c""\x0c""root-servers""\x03""net"), I4, U8("\xc6)\x00\x04")    }, /* 192.33.4.12 */
+        { U8("\x01""a""\x0c""root-servers""\x03""net"), I4, U8("\xc6)\x00\x04")    }, /* 198.41.0.4 */
+        { U8("\x01""j""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x03\x0c'\x00\x00\x00\x00\x00\x00\x00\x02\x00\x03")    },
+        { U8("\x01""k""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x07\xfd\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01") },
+        { U8("\x01""d""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x00\x00-\x00\x00\x00\x00\x00\x00\x00\x00\x00\r")      },
+        { U8("\x01""f""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x00\x00/\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0f")    },
+        { U8("\x01""h""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00S")    },
+        { U8("\x01""i""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x07\xfe\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00S")    },
+        { U8("\x01""l""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00B")    },
+        { U8("\x01""m""\x0c""root-servers""\x03""net"), I6, U8(" \x01\r\xc3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x005")      },
+        { U8("\x01""b""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x00\x00\x84\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0b") },
+        { U8("\x01""c""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c") },
+        { U8("\x01""a""\x0c""root-servers""\x03""net"), I6, U8(" \x01\x05\x03\xba>\x00\x00\x00\x00\x00\x00\x00\x02\x000")       },
 };
+#undef I4
+#undef I6
+
 
 static void update_cut_name(struct kr_zonecut *cut, const knot_dname_t *name)
 {
@@ -70,6 +86,9 @@ int kr_zonecut_init(struct kr_zonecut *cut, const knot_dname_t *name, mm_ctx_t *
 
 	cut->name = knot_dname_copy(name, pool);
 	cut->pool = pool;
+	cut->key  = NULL;
+	cut->trust_anchor = NULL;
+	cut->parent = NULL;
 	cut->nsset = map_make();
 	cut->nsset.malloc = (map_alloc_f) mm_alloc;
 	cut->nsset.free = (map_free_f) mm_free;
@@ -93,6 +112,8 @@ void kr_zonecut_deinit(struct kr_zonecut *cut)
 	mm_free(cut->pool, cut->name);
 	map_walk(&cut->nsset, free_addr_set, cut->pool);
 	map_clear(&cut->nsset);
+	knot_rrset_free(&cut->key, cut->pool);
+	knot_rrset_free(&cut->trust_anchor, cut->pool);
 }
 
 void kr_zonecut_set(struct kr_zonecut *cut, const knot_dname_t *name)
@@ -100,8 +121,13 @@ void kr_zonecut_set(struct kr_zonecut *cut, const knot_dname_t *name)
 	if (!cut || !name) {
 		return;
 	}
+	knot_rrset_t *key, *ta;
+	key = cut->key; cut->key = NULL;
+	ta = cut->trust_anchor; cut->trust_anchor = NULL;
 	kr_zonecut_deinit(cut);
 	kr_zonecut_init(cut, name, cut->pool);
+	cut->key = key;
+	cut->trust_anchor = ta;
 }
 
 static int copy_addr_set(const char *k, void *v, void *baton)
@@ -143,24 +169,32 @@ int kr_zonecut_copy(struct kr_zonecut *dst, const struct kr_zonecut *src)
 	return map_walk((map_t *)&src->nsset, copy_addr_set, dst);
 }
 
-/** @internal Filter ANY or loopback addresses. */
-static bool is_valid_addr(uint8_t *addr, size_t len)
+int kr_zonecut_copy_trust(struct kr_zonecut *dst, const struct kr_zonecut *src)
 {
-	if (len == sizeof(struct in_addr)) {
-		/* Filter ANY and 127.0.0.0/8 */
-		uint32_t ip_host = ntohl(*(uint32_t *)(addr));
-		if (ip_host == 0 || (ip_host & 0xff000000) == 0x7f000000) {
-			return false;
-		}
-	} else if (len == sizeof(struct in6_addr)) {
-		struct in6_addr ip6_mask;
-		memset(&ip6_mask, 0, sizeof(ip6_mask));
-		/* All except last byte are zeroed, last byte defines ANY/::1 */
-		if (memcmp(addr, ip6_mask.s6_addr, sizeof(ip6_mask.s6_addr) - 1) == 0) {
-			return (addr[len - 1] > 1);
+	knot_rrset_t *key_copy = NULL;
+	knot_rrset_t *ta_copy = NULL;
+
+	if (src->key) {
+		key_copy = knot_rrset_copy(src->key, dst->pool);
+		if (!key_copy) {
+			return kr_error(ENOMEM);
 		}
 	}
-	return true;
+
+	if (src->trust_anchor) {
+		ta_copy = knot_rrset_copy(src->trust_anchor, dst->pool);
+		if (!ta_copy) {
+			knot_rrset_free(&key_copy, dst->pool);
+			return kr_error(ENOMEM);
+		}
+	}
+
+	knot_rrset_free(&dst->key, dst->pool);
+	dst->key = key_copy;
+	knot_rrset_free(&dst->trust_anchor, dst->pool);
+	dst->trust_anchor = ta_copy;
+
+	return kr_ok();
 }
 
 int kr_zonecut_add(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rdata_t *rdata)
@@ -182,13 +216,9 @@ int kr_zonecut_add(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rd
 	if (rdata == NULL) {
 		return kr_ok();
 	}
-	/* Check for invalid */
+	/* Check for duplicates */
 	uint16_t rdlen = knot_rdata_rdlen(rdata);
 	uint8_t *raw_addr = knot_rdata_data(rdata);
-	if (!is_valid_addr(raw_addr, rdlen)) {
-		return kr_error(EILSEQ);
-	}
-	/* Check for duplicates */
 	if (pack_obj_find(pack, raw_addr, rdlen)) {
 		return kr_ok();
 	}
@@ -197,7 +227,7 @@ int kr_zonecut_add(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rd
 	if (ret != 0) {
 		return kr_error(ENOMEM);
 	}
-	return pack_obj_push(pack, knot_rdata_data(rdata), rdlen);
+	return pack_obj_push(pack, raw_addr, rdlen);
 }
 
 int kr_zonecut_del(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rdata_t *rdata)
@@ -243,35 +273,35 @@ int kr_zonecut_set_sbelt(struct kr_context *ctx, struct kr_zonecut *cut)
 	}
 
 	update_cut_name(cut, U8(""));
+	map_walk(&cut->nsset, free_addr_set, cut->pool);
+	map_clear(&cut->nsset);
 
 	/* Copy root hints from resolution context. */
+	int ret = 0;
 	if (ctx->root_hints.nsset.root) {
-		int ret = kr_zonecut_copy(cut, &ctx->root_hints);
-		if (ret == 0) {
-			return ret;
+		ret = kr_zonecut_copy(cut, &ctx->root_hints);
+	} else {
+		/* Copy compiled-in root hints */
+		for (unsigned i = 0; i < HINT_COUNT; ++i) {
+			const struct hint_info *hint = &SBELT[i];
+			knot_rdata_t rdata[knot_rdata_array_size(hint->len)];
+			knot_rdata_init(rdata, hint->len, hint->addr, 0);
+			ret = kr_zonecut_add(cut, hint->name, rdata);
+			if (ret != 0) {
+				break;
+			}
 		}
 	}
-
-	/* Copy compiled-in root hints */
-	for (unsigned i = 0; i < HINT_COUNT; ++i) {
-		const struct hint_info *hint = &SBELT[i];
-		knot_rdata_t rdata[knot_rdata_array_size(HINT_ADDRLEN)];
-		knot_rdata_init(rdata, HINT_ADDRLEN, hint->addr, 0);
-		int ret = kr_zonecut_add(cut, hint->name, rdata);
-		if (ret != 0) {
-			return ret;
-		}
-	}
-
-	return kr_ok();
+	return ret;
 }
 
 /** Fetch address for zone cut. */
 static void fetch_addr(struct kr_zonecut *cut, const knot_dname_t *ns, uint16_t rrtype, struct kr_cache_txn *txn, uint32_t timestamp)
 {
+	uint16_t rank = 0;
 	knot_rrset_t cached_rr;
 	knot_rrset_init(&cached_rr, (knot_dname_t *)ns, rrtype, KNOT_CLASS_IN);
-	if (kr_cache_peek_rr(txn, &cached_rr, &timestamp) != 0) {
+	if (kr_cache_peek_rr(txn, &cached_rr, &rank, &timestamp) != 0) {
 		return;
 	}
 
@@ -287,10 +317,11 @@ static void fetch_addr(struct kr_zonecut *cut, const knot_dname_t *ns, uint16_t 
 /** Fetch best NS for zone cut. */
 static int fetch_ns(struct kr_context *ctx, struct kr_zonecut *cut, const knot_dname_t *name, struct kr_cache_txn *txn, uint32_t timestamp)
 {
+	uint16_t rank = 0;
 	uint32_t drift = timestamp;
 	knot_rrset_t cached_rr;
 	knot_rrset_init(&cached_rr, (knot_dname_t *)name, KNOT_RRTYPE_NS, KNOT_CLASS_IN);
-	int ret = kr_cache_peek_rr(txn, &cached_rr, &drift);
+	int ret = kr_cache_peek_rr(txn, &cached_rr, &rank, &drift);
 	if (ret != 0) {
 		return ret;
 	}
@@ -303,32 +334,80 @@ static int fetch_ns(struct kr_context *ctx, struct kr_zonecut *cut, const knot_d
 		/* Fetch NS reputation and decide whether to prefetch A/AAAA records. */
 		unsigned *cached = lru_get(ctx->cache_rep, (const char *)ns_name, knot_dname_size(ns_name));
 		unsigned reputation = (cached) ? *cached : 0;
-		if (!(reputation & KR_NS_NOIP4)) {
+		if (!(reputation & KR_NS_NOIP4) && !(ctx->options & QUERY_NO_IPV4)) {
 			fetch_addr(cut, ns_name, KNOT_RRTYPE_A, txn, timestamp);
 		}
-		if (!(reputation & KR_NS_NOIP6)) {
+		if (!(reputation & KR_NS_NOIP6) && !(ctx->options & QUERY_NO_IPV6)) {
 			fetch_addr(cut, ns_name, KNOT_RRTYPE_AAAA, txn, timestamp);
 		}
-	}
-
-	/* Always keep SBELT as a backup for root */
-	if (name[0] == '\0') {
-		kr_zonecut_set_sbelt(ctx, cut);
 	}
 
 	return kr_ok();
 }
 
+/**
+ * Fetch RRSet of given type.
+ */
+static int fetch_rrset(knot_rrset_t **rr, const knot_dname_t *owner, uint16_t type,
+                       struct kr_cache_txn *txn, mm_ctx_t *pool, uint32_t timestamp)
+{
+	if (!rr) {
+		return kr_error(ENOENT);
+	}
+
+	uint16_t rank = 0;
+	uint32_t drift = timestamp;
+	knot_rrset_t cached_rr;
+	knot_rrset_init(&cached_rr, (knot_dname_t *)owner, type, KNOT_CLASS_IN);
+	int ret = kr_cache_peek_rr(txn, &cached_rr, &rank, &drift);
+	if (ret != 0) {
+		return ret;
+	}
+
+	knot_rrset_free(rr, pool);
+	*rr = mm_alloc(pool, sizeof(knot_rrset_t));
+	if (*rr == NULL) {
+		return kr_error(ENOMEM);
+	}
+
+	ret = kr_cache_materialize(*rr, &cached_rr, drift, pool);
+	if (ret != 0) {
+		knot_rrset_free(rr, pool);
+		return ret;
+	}
+
+	return kr_ok();
+}
+
+/**
+ * Fetch trust anchors for zone cut.
+ * @note The trust anchor can theoretically be a DNSKEY but for now lets use only DS.
+ */
+static int fetch_ta(struct kr_zonecut *cut, const knot_dname_t *name, struct kr_cache_txn *txn, uint32_t timestamp)
+{
+	return fetch_rrset(&cut->trust_anchor, name, KNOT_RRTYPE_DS, txn, cut->pool, timestamp);
+}
+
+/** Fetch DNSKEY for zone cut. */
+static int fetch_dnskey(struct kr_zonecut *cut, const knot_dname_t *name, struct kr_cache_txn *txn, uint32_t timestamp)
+{
+	return fetch_rrset(&cut->key, name, KNOT_RRTYPE_DNSKEY, txn, cut->pool, timestamp);
+}
+
 int kr_zonecut_find_cached(struct kr_context *ctx, struct kr_zonecut *cut, const knot_dname_t *name,
-                           struct kr_cache_txn *txn, uint32_t timestamp)
+                           struct kr_cache_txn *txn, uint32_t timestamp, bool secured)
 {
 	if (!ctx || !cut || !name) {
 		return kr_error(EINVAL);
 	}
 
 	/* Start at QNAME parent. */
-	while (txn) {
-		if (fetch_ns(ctx, cut, name, txn, timestamp) == 0) {
+	while (txn && name) {
+		bool has_ta = !secured || !name[0] || fetch_ta(cut, name, txn, timestamp) == 0;
+		if (has_ta && fetch_ns(ctx, cut, name, txn, timestamp) == 0) {
+			if (secured) {
+				fetch_dnskey(cut, name, txn, timestamp);
+			}
 			update_cut_name(cut, name);
 			return kr_ok();
 		}
@@ -339,6 +418,5 @@ int kr_zonecut_find_cached(struct kr_context *ctx, struct kr_zonecut *cut, const
 		name = knot_wire_next_label(name, NULL);
 	}
 
-	/* Name server not found, start with SBELT. */
-	return kr_zonecut_set_sbelt(ctx, cut);
+	return kr_error(ENOENT);
 }

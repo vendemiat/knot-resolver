@@ -6,6 +6,12 @@ GB = 1024*MB
 sec = 1000
 minute = 60 * sec
 hour = 60 * minute
+day = 24 * hour
+
+-- Resolver bindings
+kres = require('kres')
+trust_anchors = require('trust_anchors')
+resolve = worker.resolve
 
 -- Function aliases
 -- `env.VAR returns os.getenv(VAR)`
@@ -17,17 +23,24 @@ setmetatable(env, {
 -- Quick access to interfaces
 -- `net.<iface>` => `net.interfaces()[iface]`
 -- `net = {addr1, ..}` => `net.listen(name, addr1)`
+-- `net.ipv{4,6} = {true, false}` => enable/disable IPv{4,6}
 setmetatable(net, {
 	__index = function (t, k)
 		local v = rawget(t, k)
 		if v then return v
+		elseif k == 'ipv6' then return not option('NO_IPV6')
+		elseif k == 'ipv4' then return not option('NO_IPV4')
 		else return net.interfaces()[k]
 		end
 	end,
 	__newindex = function (t,k,v)
-		local iname = rawget(net.interfaces(), v)
-		if iname then t.listen(iname)
-		else t.listen(v)
+		if     k == 'ipv6' then return option('NO_IPV6', not v)
+		elseif k == 'ipv4' then return option('NO_IPV4', not v)
+		else
+			local iname = rawget(net.interfaces(), v)
+			if iname then t.listen(iname)
+			else t.listen(v)
+			end
 		end
 	end
 })
@@ -36,14 +49,17 @@ setmetatable(net, {
 -- `modules.<name> = <config>`
 setmetatable(modules, {
 	__newindex = function (t,k,v)
-		if type(k) == 'number' then k = v end
+		if type(k) == 'number' then k = v v = nil end
 		if not rawget(_G, k) then
 			modules.load(k)
-			local mod = rawget(_G, k)
-			if k ~= v and mod and mod['config'] then
-				mod['config'](v)
+			k = string.match(k, '%w+')
+			local mod = _G[k]
+			local config = rawget(mod, 'config')
+			if mod and config then
+				if k ~= v then config(v)
+				else           config()
+				end
 			end
-
 		end
 	end
 })
@@ -62,6 +78,15 @@ setmetatable(cache, {
 		elseif k == 'storage' then t.open(size, v)
 		else   rawset(t, k, v) end
 	end
+})
+
+-- Syntactic sugar for TA store
+setmetatable(trust_anchors, {
+	__newindex = function (t,k,v)
+	if     k == 'file' then t.config(v)
+	elseif k == 'negative' then t.set_insecure(v)
+	else   rawset(t, k, v) end
+	end,
 })
 
 -- Register module in Lua environment
@@ -85,7 +110,7 @@ end
 
 -- Make sandboxed environment
 local function make_sandbox(defined)
-	local __protected = { modules = true, cache = true, net = true }
+	local __protected = { modules = true, cache = true, net = true, trust_anchors = true }
 	return setmetatable({}, {
 		__index = defined,
 		__newindex = function (t, k, v)
@@ -135,18 +160,31 @@ function table_print (tt, indent, done)
 	done = done or {}
 	indent = indent or 0
 	result = ""
+	-- Convert to printable string (escape unprintable)
+	local function printable(value)
+		value = tostring(value)
+		local bytes = {}
+		for i = 1, #value do
+			local c = string.byte(value, i)
+			if c >= 0x20 and c < 0x7f then table.insert(bytes, string.char(c))
+			else                           table.insert(bytes, '\\'..tostring(c))
+			end
+			if i > 50 then table.insert(bytes, '...') break end
+		end
+		return table.concat(bytes)
+	end
 	if type(tt) == "table" then
 		for key, value in pairs (tt) do
 			result = result .. string.rep (" ", indent)
 			if type (value) == "table" and not done [value] then
 				done [value] = true
-				result = result .. string.format("[%s] => {\n", tostring (key))
+				result = result .. string.format("[%s] => {\n", printable (key))
 				result = result .. table_print (value, indent + 4, done)
 				result = result .. string.rep (" ", indent)
 				result = result .. "}\n"
 			else
 				result = result .. string.format("[%s] => %s\n",
-				         tostring (key), tostring(value))
+				         tostring (key), printable(value))
 			end
 		end
 	else

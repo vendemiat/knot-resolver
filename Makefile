@@ -11,23 +11,26 @@ doc: doc-html
 
 # Options
 ifdef COVERAGE
-CFLAGS += --coverage
+BUILD_CFLAGS += --coverage
 endif
 
 # Dependencies
-$(eval $(call find_lib,libknot))
-$(eval $(call find_lib,libuv))
+$(eval $(call find_lib,libknot,2.0))
+$(eval $(call find_lib,libuv,1.0))
 $(eval $(call find_alt,lua,luajit))
-$(eval $(call find_alt,lua,lua5.2))
-$(eval $(call find_alt,lua,lua-5.2))
-$(eval $(call find_alt,lua,lua))
 $(eval $(call find_lib,cmocka))
 $(eval $(call find_bin,doxygen))
 $(eval $(call find_bin,sphinx-build))
-$(eval $(call find_bin,gccgo))
-$(eval $(call find_python))
+$(eval $(call find_bin,python))
 $(eval $(call find_lib,libmemcached,1.0))
 $(eval $(call find_lib,hiredis))
+$(eval $(call find_lib,socket_wrapper))
+$(eval $(call find_lib,libdnssec))
+$(eval $(call find_gopkg,geoip,github.com/abh/geoip))
+# Find Go compiler version
+E :=
+GO_VERSION := $(subst $(E) $(E),,$(subst go,,$(wordlist 1,2,$(subst ., ,$(word 3,$(shell $(GO) version))))))
+$(eval $(call find_ver,go,$(GO_VERSION),15))
 
 # Work around luajit on OS X
 ifeq ($(PLATFORM), Darwin)
@@ -36,7 +39,7 @@ ifneq (,$(findstring luajit, $(lua_LIBS)))
 endif
 endif
 
-CFLAGS += $(libknot_CFLAGS) $(libuv_CFLAGS) $(cmocka_CFLAGS) $(python_CFLAGS) $(lua_CFLAGS)
+BUILD_CFLAGS += $(libknot_CFLAGS) $(libuv_CFLAGS) $(cmocka_CFLAGS) $(python_CFLAGS) $(lua_CFLAGS) $(libdnssec_CFLAGS)
 
 # Sub-targets
 include help.mk

@@ -30,9 +30,9 @@ The following is a list of software required to build Knot DNS Resolver from sou
    "`GNU Make`_ 3.80+", "*all*", "*(build only)*"
    "`pkg-config`_", "*all*", "*(build only)* [#]_"
    "C compiler", "*all*", "*(build only)* [#]_"
-   "libknot_ 2.0+", "*all*", "Knot DNS library."
-   "Lua_ 5.1+", "``daemon``", "Embeddable scripting language (LuaJIT_ is preferred)."
-   "libuv_ 1.0+", "``daemon``", "Multiplatform I/O and services."
+   "libknot_ 2.0+", "*all*", "Knot DNS library (requires autotools, GnuTLS and Jansson)."
+   "LuaJIT_ 2.0+", "``daemon``", "Embedded scripting language."
+   "libuv_ 1.7+", "``daemon``", "Multiplatform I/O and services (libuv_ 1.0 with limitations [#]_)."
 
 There are also *optional* packages that enable specific functionality in Knot DNS Resolver, they are useful mainly for developers to build documentation and tests.
 
@@ -41,15 +41,40 @@ There are also *optional* packages that enable specific functionality in Knot DN
 
    "libmemcached_", "``modules/memcached``", "To build memcached backend module."
    "hiredis_", "``modules/redis``", "To build redis backend module."
+   "Go_ 1.5+", "``modules``", "Build modules written in Go."
    "cmocka_", "``unit tests``", "Unit testing framework."
-   "Python_", "``integration tests``", "For scripting tests, C header files are required (``python-dev``)"
-   "GCCGO_",  "``modules/go``", "For building Go modules, see modules documentation."
+   "Python_", "``integration tests``", "For test scripts."
    "Doxygen_", "``documentation``", "Generating API documentation."
    "Sphinx_", "``documentation``", "Building this HTML/PDF documentation."
    "breathe_", "``documentation``", "Exposing Doxygen API doc to Sphinx."
 
 .. [#] Requires C99, ``__attribute__((cleanup))`` and ``-MMD -MP`` for dependency file generation. GCC, Clang and ICC are supported.
 .. [#] You can use variables ``<dependency>_CFLAGS`` and ``<dependency>_LIBS`` to configure dependencies manually (i.e. ``libknot_CFLAGS`` and ``libknot_LIBS``).
+.. [#] libuv 1.7 brings SO_REUSEPORT support that is needed for multiple forks. libuv < 1.7 can be still used, but only in single-process mode. Use :ref:`different method <daemon-reuseport>` for load balancing.
+
+Packaged dependencies
+~~~~~~~~~~~~~~~~~~~~~
+
+Most of the dependencies can be resolved from packages, here's an overview for several platforms.
+
+* **Debian** (since *sid*) - current stable doesn't have libknot and libuv, which must be installed from sources.
+
+.. code-block:: bash
+
+   sudo apt-get install pkg-config libknot-dev libuv1-dev libcmocka-dev libluajit-5.1-dev
+
+* **Ubuntu** - unknown.
+* **RHEL/CentOS** - unknown.
+* **openSUSE** - there is an `experimental package <https://build.opensuse.org/package/show/server:dns/knot-resolver>`_.
+* **RHEL** - unknown.
+* **FreeBSD** - unknown.
+* **NetBSD** - unknown.
+* **OpenBSD** - unknown.
+* **Mac OS X** - most of the dependencies can be found through `Homebrew <http://brew.sh/>`_, with the exception of libknot.
+
+.. code-block:: bash
+
+   brew install pkg-config libuv luajit cmocka
 
 Getting Docker image
 --------------------
@@ -72,15 +97,36 @@ You can hack on the container by changing the container entrypoint to shell like
 Building from sources 
 ---------------------
 
-The Knot DNS Resolver depends on the development version of the Knot DNS library, and a reasonably recent version of `libuv`.
-Several dependencies may not be in the packages yet, the script pulls and installs all dependencies in a chroot.
+The Knot DNS Resolver depends on the the Knot DNS library, recent version of libuv_, and LuaJIT_.
 
 .. code-block:: bash
 
    $ make info # See what's missing
 
+When you have all the dependencies ready, you can build and install.
+
+.. code-block:: bash
+
+   $ make PREFIX="/usr/local"
+   $ make install
+
+.. note:: Always build with ``PREFIX`` if you want to install, as it is hardcoded in the executable for module search path. If you build the binary with ``-DNDEBUG``, verbose logging will be disabled as well.
+
+Alternatively you can build only specific parts of the project, i.e. ``library``.
+
+.. code-block:: bash
+
+   $ make lib
+   $ make lib-install
+
+.. note:: Documentation is not built by default, run ``make doc`` to build it.
+
+Building dependencies
+~~~~~~~~~~~~~~~~~~~~~
+
+Several dependencies may not be in the packages yet, the script pulls and installs all dependencies in a chroot.
 You can avoid rebuilding dependencies by specifying `BUILD_IGNORE` variable, see the Dockerfile_ for example.
-Usually you only really need to rebuild `libknot`.
+Usually you only really need to rebuild libknot_.
 
 .. code-block:: bash
 
@@ -94,30 +140,11 @@ Usually you only really need to rebuild `libknot`.
 
    .. code-block:: bash
 
-      $ make check libknot_CFLAGS="-I/opt/include" libknot_LIBS="-L/opt/lib -lknot -lknot-int -ldnssec"
+      $ make libknot_CFLAGS="-I/opt/include" libknot_LIBS="-L/opt/lib -lknot -lknot-int -ldnssec"
 
 .. warning:: If the dependencies lie outside of library search path, you need to add them somehow.
    Try ``LD_LIBRARY_PATH`` on Linux/BSD, and ``DYLD_FALLBACK_LIBRARY_PATH`` on OS X.
    Otherwise you need to add the locations to linker search path.
-
-When you have all the dependencies ready, you can build, test and install.
-
-.. code-block:: bash
-
-   $ make PREFIX="/usr/local"
-   $ make check
-   $ make install
-
-.. note:: Always build with ``PREFIX`` if you want to install, as it is hardcoded in the executable for module search path.
-
-Alternatively you can build only specific parts of the project, i.e. ``library``.
-
-.. code-block:: bash
-
-   $ make lib
-   $ make lib-install
-
-.. note:: Documentation is not built by default, run ``make doc`` to build it.
 
 Building extras
 ~~~~~~~~~~~~~~~
@@ -132,7 +159,7 @@ The project can be built with code coverage tracking using the ``COVERAGE=1`` va
 
 .. _Lua: http://www.lua.org/about.html
 .. _LuaJIT: http://luajit.org/luajit.html
-.. _GCCGO: https://golang.org/doc/install/gccgo
+.. _Go: https://golang.org
 .. _libmemcached: http://libmemcached.org/libMemcached.html
 .. _hiredis: https://github.com/redis/hiredis
 .. _Doxygen: http://www.stack.nl/~dimitri/doxygen/manual/index.html

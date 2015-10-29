@@ -19,8 +19,7 @@
 #include "daemon/io.h"
 
 /* libuv 1.7.0+ is able to support SO_REUSEPORT for loadbalancing */
-#define UV_VERSION_NUM UV_VERSION_MAJOR ## UV_VERSION_MINOR ## UV_VERSION_PATCH
-#if (defined(ENABLE_REUSEPORT) || UV_VERSION_NUM >= 170) && (__linux__ && SO_REUSEPORT)
+#if (defined(ENABLE_REUSEPORT) || defined(UV_VERSION_HEX)) && (__linux__ && SO_REUSEPORT)
   #define handle_init(type, loop, handle, family) do { \
 	uv_ ## type ## _init_ex((loop), (handle), (family)); \
 	uv_os_fd_t fd = 0; \
@@ -37,20 +36,36 @@
 void network_init(struct network *net, uv_loop_t *loop)
 {
 	if (net != NULL) {
-		/* No multiplexing now, I/O in single thread. */
 		net->loop = loop;
 		net->endpoints = map_make();
 	}
 }
 
-/** Close endpoint protocols. */
-static int close_endpoint(struct endpoint *ep)
+static void free_handle(uv_handle_t *handle)
 {
-	if (ep->flags & NET_UDP) {
-		udp_unbind(ep);
+	free(handle);
+}
+
+static void close_handle(uv_handle_t *handle, bool force)
+{
+	if (force) { /* Force close if event loop isn't running. */
+		uv_os_fd_t fd = 0;
+		if (uv_fileno(handle, &fd) == 0) {
+			close(fd);
+		}
+		free_handle(handle);
+	} else { /* Asynchronous close */
+		uv_close(handle, free_handle);
 	}
-	if (ep->flags & NET_TCP) {
-		tcp_unbind(ep);
+}
+
+static int close_endpoint(struct endpoint *ep, bool force)
+{
+	if (ep->udp) {
+		close_handle((uv_handle_t *)ep->udp, force);
+	}
+	if (ep->tcp) {
+		close_handle((uv_handle_t *)ep->tcp, force);
 	}
 
 	free(ep);
@@ -58,12 +73,11 @@ static int close_endpoint(struct endpoint *ep)
 }
 
 /** Endpoint visitor (see @file map.h) */
-static int visit_key(const char *key, void *val, void *ext)
+static int close_key(const char *key, void *val, void *ext)
 {
-	int (*callback)(struct endpoint *) = ext;
 	endpoint_array_t *ep_array = val;
 	for (size_t i = ep_array->len; i--;) {
-		callback(ep_array->at[i]);
+		close_endpoint(ep_array->at[i], true);
 	}
 	return 0;
 }
@@ -79,7 +93,7 @@ static int free_key(const char *key, void *val, void *ext)
 void network_deinit(struct network *net)
 {
 	if (net != NULL) {
-		map_walk(&net->endpoints, visit_key, close_endpoint);
+		map_walk(&net->endpoints, close_key, 0);
 		map_walk(&net->endpoints, free_key, 0);
 		map_clear(&net->endpoints);
 	}
@@ -112,16 +126,24 @@ static int insert_endpoint(struct network *net, const char *addr, struct endpoin
 static int open_endpoint(struct network *net, struct endpoint *ep, struct sockaddr *sa, uint32_t flags)
 {
 	if (flags & NET_UDP) {
-		handle_init(udp, net->loop, &ep->udp, sa->sa_family);
-		int ret = udp_bind(ep, sa);
+		ep->udp = malloc(sizeof(*ep->udp));
+		if (!ep->udp) {
+			return kr_error(ENOMEM);
+		}
+		handle_init(udp, net->loop, ep->udp, sa->sa_family);
+		int ret = udp_bind(ep->udp, sa);
 		if (ret != 0) {
 			return ret;
 		}
 		ep->flags |= NET_UDP;
 	}
 	if (flags & NET_TCP) {
-		handle_init(tcp, net->loop, &ep->tcp, sa->sa_family);
-		int ret = tcp_bind(ep, sa);
+		ep->tcp = malloc(sizeof(*ep->tcp));
+		if (!ep->tcp) {
+			return kr_error(ENOMEM);
+		}
+		handle_init(tcp, net->loop, ep->tcp, sa->sa_family);
+		int ret = tcp_bind(ep->tcp, sa);
 		if (ret != 0) {
 			return ret;
 		}
@@ -130,10 +152,32 @@ static int open_endpoint(struct network *net, struct endpoint *ep, struct sockad
 	return kr_ok();
 }
 
+/** @internal Fetch endpoint array and offset of the address/port query. */
+static endpoint_array_t *network_get(struct network *net, const char *addr, uint16_t port, size_t *index)
+{
+	endpoint_array_t *ep_array = map_get(&net->endpoints, addr);
+	if (ep_array) {
+		for (size_t i = ep_array->len; i--;) {
+			struct endpoint *ep = ep_array->at[i];
+			if (ep->port == port) {
+				*index = i;
+				return ep_array;
+			}
+		}
+	}
+	return NULL;
+}
+
 int network_listen(struct network *net, const char *addr, uint16_t port, uint32_t flags)
 {
 	if (net == NULL || addr == 0 || port == 0) {
 		return kr_error(EINVAL);
+	}
+
+	/* Already listening */
+	size_t index = 0;
+	if (network_get(net, addr, port, &index)) {
+		return kr_ok();
 	}
 
 	/* Parse address. */
@@ -158,7 +202,7 @@ int network_listen(struct network *net, const char *addr, uint16_t port, uint32_
 		ret = insert_endpoint(net, addr, ep);
 	}
 	if (ret != 0) {
-		close_endpoint(ep);
+		close_endpoint(ep, false);
 	}
 
 	return ret;
@@ -166,20 +210,15 @@ int network_listen(struct network *net, const char *addr, uint16_t port, uint32_
 
 int network_close(struct network *net, const char *addr, uint16_t port)
 {
-	endpoint_array_t *ep_array = map_get(&net->endpoints, addr);
-	if (ep_array == NULL) {
+	size_t index = 0;
+	endpoint_array_t *ep_array = network_get(net, addr, port, &index);
+	if (!ep_array) {
 		return kr_error(ENOENT);
 	}
 
 	/* Close endpoint in array. */
-	for (size_t i = ep_array->len; i--;) {
-		struct endpoint *ep = ep_array->at[i];
-		if (ep->port == port) {
-			close_endpoint(ep);
-			array_del(*ep_array, i);
-			break;
-		}
-	}
+	close_endpoint(ep_array->at[index], false);
+	array_del(*ep_array, index);
 
 	/* Collapse key if it has no endpoint. */
 	if (ep_array->len == 0) {
