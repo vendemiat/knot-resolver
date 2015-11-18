@@ -167,6 +167,20 @@ int mm_reserve(void *baton, char **mem, size_t elm_size, size_t want, size_t *ha
     return -1;
 }
 
+int kr_pkt_recycle(knot_pkt_t *pkt)
+{
+	pkt->rrset_count = 0;
+	pkt->size = KNOT_WIRE_HEADER_SIZE;
+	pkt->current = KNOT_ANSWER;
+	knot_wire_set_qdcount(pkt->wire, 0);
+	knot_wire_set_ancount(pkt->wire, 0);
+	knot_wire_set_nscount(pkt->wire, 0);
+	knot_wire_set_arcount(pkt->wire, 0);
+	memset(pkt->sections, 0, sizeof(pkt->sections));
+	knot_pkt_begin(pkt, KNOT_ANSWER);
+	return knot_pkt_parse_question(pkt);
+}
+
 int kr_pkt_put(knot_pkt_t *pkt, const knot_dname_t *name, uint32_t ttl,
                uint16_t rclass, uint16_t rtype, const uint8_t *rdata, uint16_t rdlen)
 {
@@ -217,7 +231,11 @@ int kr_straddr_family(const char *addr)
 
 int kr_family_len(int family)
 {
-	return (family == AF_INET) ? sizeof(struct in_addr) : sizeof(struct in6_addr);
+	switch (family) {
+	case AF_INET:  return sizeof(struct in_addr);
+	case AF_INET6: return sizeof(struct in6_addr);
+	default:       return kr_error(EINVAL);
+	}
 }
 
 int kr_straddr_subnet(void *dst, const char *addr)

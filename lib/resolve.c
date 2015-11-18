@@ -162,7 +162,7 @@ static int ns_fetch_cut(struct kr_query *qry, struct kr_request *req, knot_pkt_t
 		/* If at/subdomain of parent zone cut, start from its encloser.
 		 * This is for case when we get to a dead end (and need glue from parent), or DS refetch. */
 		struct kr_query *parent = qry->parent;
-		if (parent && qry->sname[0] != '\0' && knot_dname_in(parent->zone_cut.name, qry->sname)) {
+		if (parent && parent->zone_cut.name[0] != '\0' && knot_dname_in(parent->zone_cut.name, qry->sname)) {
 			const knot_dname_t *encloser = knot_wire_next_label(parent->zone_cut.name, NULL);
 			ret = kr_zonecut_find_cached(req->ctx, &qry->zone_cut, encloser, &txn, qry->timestamp.tv_sec, secured);
 		} else {
@@ -325,8 +325,14 @@ static int query_finalize(struct kr_request *request, struct kr_query *qry, knot
 	knot_pkt_begin(pkt, KNOT_ADDITIONAL);
 	if (!(qry->flags & QUERY_SAFEMODE)) {
 		ret = edns_create(pkt, request->answer, request);
-		if (ret == 0) { /* Enable DNSSEC for query. */
-			if (qry->flags & QUERY_DNSSEC_WANT) {
+		if (ret == 0) {
+			/* Stub resolution (ask for +rd and +do) */
+			if (qry->flags & QUERY_STUB) {
+				knot_wire_set_rd(pkt->wire);
+				if (knot_pkt_has_dnssec(request->answer))
+					knot_edns_set_do(pkt->opt_rr);
+			/* Full resolution (ask for +cd and +do) */
+			} else if (qry->flags & QUERY_DNSSEC_WANT) {
 				knot_edns_set_do(pkt->opt_rr);
 				knot_wire_set_cd(pkt->wire);
 			}
@@ -344,6 +350,8 @@ int kr_resolve_begin(struct kr_request *request, struct kr_context *ctx, knot_pk
 	request->options = ctx->options;
 	request->state = KNOT_STATE_CONSUME;
 	request->current_query = NULL;
+	request->qsource.key = NULL;
+	request->qsource.addr = NULL;
 	array_init(request->authority);
 	array_init(request->additional);
 
@@ -405,12 +413,6 @@ int kr_resolve_consume(struct kr_request *request, const struct sockaddr *src, k
 	struct kr_query *qry = TAIL(rplan->pending);
 	bool tried_tcp = (qry->flags & QUERY_TCP);
 	if (!packet || packet->size == 0) {
-		/* Network error, retry over TCP. */
-		if (!tried_tcp) {
-			DEBUG_MSG(qry, "=> NS unreachable, retrying over TCP\n");
-			qry->flags |= QUERY_TCP;
-			return KNOT_STATE_PRODUCE;
-		}
 		request->state = KNOT_STATE_FAIL;
 	} else {
 		/* Packet cleared, derandomize QNAME. */
@@ -535,9 +537,13 @@ static int trust_chain_check(struct kr_request *request, struct kr_query *qry)
 /** @internal Check current zone cut status and credibility, spawn subrequests if needed. */
 static int zone_cut_check(struct kr_request *request, struct kr_query *qry, knot_pkt_t *packet)
 {
-	struct kr_rplan *rplan = &request->rplan;
 	map_t *trust_anchors = &request->ctx->trust_anchors;
 	map_t *negative_anchors = &request->ctx->negative_anchors;
+
+	/* Stub mode, just forward and do not solve cut. */
+	if (qry->flags & QUERY_STUB) {
+		return KNOT_STATE_PRODUCE;
+	}
 
 	/* The query wasn't resolved from cache,
 	 * now it's the time to look up closest zone cut from cache. */
@@ -557,12 +563,7 @@ static int zone_cut_check(struct kr_request *request, struct kr_query *qry, knot
 				if (ret != 0) {
 					return KNOT_STATE_FAIL;
 				}
-				if (qry->sname[0] != '\0') {
-					DEBUG_MSG(qry, "=> root priming query\n");
-					zone_cut_subreq(rplan, qry, qry->zone_cut.name, KNOT_RRTYPE_NS);
-				} else {
-					DEBUG_MSG(qry, "=> using root hints\n");
-				}
+				DEBUG_MSG(qry, "=> using root hints\n");
 				qry->flags &= ~QUERY_AWAIT_CUT;
 				return KNOT_STATE_DONE;
 			} else {
@@ -653,10 +654,9 @@ ns_election:
 	}
 	if (qry->flags & (QUERY_AWAIT_IPV4|QUERY_AWAIT_IPV6)) {
 		kr_nsrep_elect_addr(qry, request->ctx);
-	} else if (!qry->ns.name || !(qry->flags & QUERY_TCP)) { /* Keep address when TCP retransmit. */
+	} else if (!qry->ns.name || !(qry->flags & (QUERY_TCP|QUERY_STUB))) { /* Keep NS when requerying/stub. */
 		/* Root DNSKEY must be fetched from the hints to avoid chicken and egg problem. */
 		if (qry->sname[0] == '\0' && qry->stype == KNOT_RRTYPE_DNSKEY) {
-			DEBUG_MSG(qry, "=> priming root DNSKEY\n");
 			kr_zonecut_set_sbelt(request->ctx, &qry->zone_cut);
 			qry->flags |= QUERY_NO_THROTTLE; /* Pick even bad SBELT servers */
 		}
@@ -726,9 +726,10 @@ int kr_resolve_finish(struct kr_request *request, int state)
 		}
 	}
 
+	request->state = state;
 	ITERATE_LAYERS(request, NULL, finish);
 	DEBUG_MSG(NULL, "finished: %d, queries: %zu, mempool: %zu B\n",
-	          state, list_size(&rplan->resolved), (size_t) mp_total_size(request->pool.ctx));
+	          request->state, list_size(&rplan->resolved), (size_t) mp_total_size(request->pool.ctx));
 	return KNOT_STATE_DONE;
 }
 

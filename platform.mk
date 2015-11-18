@@ -10,6 +10,7 @@ MODTYPE := shared
 ARTYPE  := static
 BINEXT :=
 PLATFORM = Linux
+ARCH := $(word 1, $(subst -, ,$(shell $(CC) -dumpmachine)))
 ifeq ($(OS),Windows_NT)
 	PLATFORM := Windows
 	RM := del

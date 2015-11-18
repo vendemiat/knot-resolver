@@ -495,7 +495,9 @@ static void event_callback(uv_timer_t *timer)
 	int ret = execute_callback(L, 1);
 	/* Free callback if not recurrent or an error */
 	if (ret != 0 || uv_timer_get_repeat(timer) == 0) {
-		uv_close((uv_handle_t *)timer, (uv_close_cb) event_free);
+		if (!uv_is_closing((uv_handle_t *)timer)) {
+			uv_close((uv_handle_t *)timer, (uv_close_cb) event_free);
+		}
 	}
 }
 
@@ -572,7 +574,9 @@ static int event_cancel(lua_State *L)
 	/* Close the timer */
 	lua_rawgeti(L, -1, 2);
 	uv_handle_t *timer = lua_touserdata(L, -1);
-	uv_close(timer, (uv_close_cb) event_free);
+	if (!uv_is_closing(timer)) {
+		uv_close(timer, (uv_close_cb) event_free);
+	}
 	lua_pushboolean(L, true);
 	return 1;
 }
@@ -638,7 +642,7 @@ static int wrk_resolve(lua_State *L)
 	knot_pkt_put_question(pkt, dname, rrclass, rrtype);
 	knot_wire_set_rd(pkt->wire);
 	/* Add OPT RR */
-	pkt->opt_rr = knot_rrset_copy(worker->engine->resolver.opt_rr, &pkt->mm);
+	pkt->opt_rr = knot_rrset_copy(worker->engine->resolver.opt_rr, NULL);
 	if (!pkt->opt_rr) {
 		return kr_error(ENOMEM);
 	}	
@@ -654,6 +658,7 @@ static int wrk_resolve(lua_State *L)
 		ret = worker_resolve(worker, pkt, options, NULL, NULL);
 	}
 	
+	knot_rrset_free(&pkt->opt_rr, NULL);
 	knot_pkt_free(&pkt);
 	lua_pushboolean(L, ret == 0);
 	return 1;

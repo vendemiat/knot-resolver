@@ -88,6 +88,7 @@ struct pkt_rcode {
 };
 struct query_flag {
 	static const int NO_MINIMIZE = 1 << 0;
+	static const int NO_THROTTLE = 1 << 1;
 	static const int NO_IPV6     = 1 << 2;
 	static const int NO_IPV4     = 1 << 3;
 	static const int RESOLVED    = 1 << 5;
@@ -96,6 +97,7 @@ struct query_flag {
 	static const int NO_CACHE    = 1 << 11;
 	static const int EXPIRING    = 1 << 12;
 	static const int DNSSEC_WANT = 1 << 14;
+	static const int STUB        = 1 << 17;
 };
 
 /*
@@ -242,14 +244,19 @@ struct kr_query *kr_rplan_push(struct kr_rplan *rplan, struct kr_query *parent,
                                const knot_dname_t *name, uint16_t cls, uint16_t type);
 struct kr_query *kr_rplan_resolved(struct kr_rplan *rplan);
 struct kr_query *kr_rplan_next(struct kr_query *qry);
+/* Nameservers */
+int kr_nsrep_set(struct kr_query *qry, uint8_t *addr, size_t addr_len);
 /* Query */
 /* Utils */
 unsigned kr_rand_uint(unsigned max);
 int kr_pkt_put(knot_pkt_t *pkt, const knot_dname_t *name, uint32_t ttl,
                uint16_t rclass, uint16_t rtype, const uint8_t *rdata, uint16_t rdlen);
+int kr_pkt_recycle(knot_pkt_t *pkt);
 const char *kr_inaddr(const struct sockaddr *addr);
 int kr_inaddr_len(const struct sockaddr *addr);
 int kr_straddr_family(const char *addr);
+int kr_straddr_subnet(void *dst, const char *addr);
+int kr_bitcmp(const char *a, const char *b, int bits);
 int kr_family_len(int family);
 int kr_rrarray_add(rr_array_t *array, const knot_rrset_t *rr, void *pool);
 /* Trust anchors */
@@ -267,6 +274,7 @@ int kr_dnssec_key_match(const uint8_t *key_a_rdata, size_t key_a_rdlen,
 ]]
 
 -- Metatype for sockaddr
+local addr_buf = ffi.new('char[16]')
 local sockaddr_t = ffi.typeof('struct sockaddr')
 ffi.metatype( sockaddr_t, {
 	__index = {
@@ -316,21 +324,26 @@ ffi.metatype( knot_pkt_t, {
 		section = function (pkt, section_id)
 			local records = {}
 			local section = C.knot_pkt_section(pkt, section_id)
-			for i = 0, section.count - 1 do
-				local rrset = knot.knot_pkt_rr(section, i)
-				for k = 0, rrset.rr.count - 1 do
-					table.insert(records, rrset:get(k))
+			for i = 1, section.count do
+				local rrset = knot.knot_pkt_rr(section, i - 1)
+				for k = 1, rrset.rr.count do
+					table.insert(records, rrset:get(k - 1))
 				end
 			end
 			return records
 		end, 
 		begin = function (pkt, section) return knot.knot_pkt_begin(pkt, section) end,
 		put = function (pkt, owner, ttl, rclass, rtype, rdata)
-			return C.kr_pkt_put(pkt, owner, ttl, rclass, rtype, rdata, string.len(rdata))
-		end
+			return C.kr_pkt_put(pkt, owner, ttl, rclass, rtype, rdata, #rdata)
+		end,
+		clear = function (pkt) return C.kr_pkt_recycle(pkt) end,
+		question = function(pkt, qname, qclass, qtype)
+			return C.knot_pkt_put_question(pkt, qname, qclass, qtype)
+		end,
 	},
 })
 -- Metatype for query
+local ub_t = ffi.typeof('unsigned char *')
 local kr_query_t = ffi.typeof('struct kr_query')
 ffi.metatype( kr_query_t, {
 	__index = {
@@ -344,6 +357,10 @@ ffi.metatype( kr_query_t, {
 		end,
 		final = function(qry)
 			return qry:resolved() and (qry.parent == nil)
+		end,
+		nslist = function(qry, ns)
+			if ns ~= nil then C.kr_nsrep_set(qry, ffi.cast(ub_t, ns), #ns) end
+			-- @todo: Return list of NS entries, not possible ATM because the NSLIST is union and missing typedef
 		end,
 	},
 })
@@ -413,11 +430,10 @@ local kres = {
 	dname2str = dname2str,
 	rr2str = rr2str,
 	str2ip = function (ip)
-		local buf = ffi.new('char [16]')
 		local family = C.kr_straddr_family(ip)
-		local ret = C.inet_pton(family, ip, buf)
+		local ret = C.inet_pton(family, ip, addr_buf)
 		if ret ~= 1 then return nil end
-		return ffi.string(buf, C.kr_family_len(family))
+		return ffi.string(addr_buf, C.kr_family_len(family))
 	end,
 	context = function () return ffi.cast('struct kr_context *', __engine) end,
 }

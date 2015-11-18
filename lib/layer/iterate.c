@@ -37,7 +37,7 @@ static const knot_dname_t *minimized_qname(struct kr_query *query, uint16_t *qty
 {
 	/* Minimization disabled. */
 	const knot_dname_t *qname = query->sname;
-	if (qname[0] == '\0' || query->flags & QUERY_NO_MINIMIZE) {
+	if (qname[0] == '\0' || query->flags & (QUERY_NO_MINIMIZE|QUERY_STUB)) {
 		return qname;
 	}
 
@@ -113,7 +113,9 @@ static void follow_cname_chain(const knot_dname_t **cname, const knot_rrset_t *r
                                struct kr_query *cur)
 {
 	if (rr->type == KNOT_RRTYPE_CNAME) {
-		*cname = knot_cname_name(&rr->rrs);
+		const knot_dname_t *next_cname = knot_cname_name(&rr->rrs);
+		if (next_cname)
+			*cname = next_cname;
 	} else if (rr->type != KNOT_RRTYPE_RRSIG) {
 		/* Terminate CNAME chain (if not RRSIG). */
 		*cname = cur->sname;
@@ -170,8 +172,10 @@ static int update_answer(const knot_rrset_t *rr, unsigned hint, knot_pkt_t *answ
 			return KNOT_STATE_DONE; /* Scrub */
 		}
 	}
-
-	int ret = knot_pkt_put(answer, hint, rr, 0);
+	/* Copy record, as it may be accessed after packet processing. */
+	knot_rrset_t *copy = knot_rrset_copy(rr, &answer->mm);
+	/* Write to final answer. */
+	int ret = knot_pkt_put(answer, hint, copy, KNOT_PF_FREE);
 	if (ret != KNOT_EOK) {
 		knot_wire_set_tc(answer->wire);
 		return KNOT_STATE_DONE;
@@ -260,6 +264,11 @@ static int process_authority(knot_pkt_t *pkt, struct kr_request *req)
 	struct kr_query *qry = req->current_query;
 	const knot_pktsection_t *ns = knot_pkt_section(pkt, KNOT_AUTHORITY);
 
+	/* Stub resolution doesn't process authority */
+	if (qry->flags & QUERY_STUB) {
+		return KNOT_STATE_CONSUME;
+	}
+
 #ifdef STRICT_MODE
 	/* AA, terminate resolution chain. */
 	if (knot_wire_get_aa(pkt->wire)) {
@@ -337,7 +346,7 @@ static int process_answer(knot_pkt_t *pkt, struct kr_request *req)
 	}
 
 	/* This answer didn't improve resolution chain, therefore must be authoritative (relaxed to negative). */
-	if (!is_authoritative(pkt, query)) {
+	if (!(query->flags & QUERY_STUB) && !is_authoritative(pkt, query)) {
 		if (pkt_class & (PKT_NXDOMAIN|PKT_NODATA)) {
 			DEBUG_MSG("<= lame response: non-auth sent negative response\n");
 			return KNOT_STATE_FAIL;
@@ -524,8 +533,7 @@ static int resolve(knot_layer_t *ctx, knot_pkt_t *pkt)
 	}
 
 	/* Resolve authority to see if it's referral or authoritative. */
-	int state = KNOT_STATE_CONSUME;
-	state = process_authority(pkt, req);
+	int state = process_authority(pkt, req);
 	switch(state) {
 	case KNOT_STATE_CONSUME: /* Not referral, process answer. */
 		DEBUG_MSG("<= rcode: %s\n", rcode ? rcode->name : "??");

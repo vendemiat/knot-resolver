@@ -9,8 +9,7 @@ local key_state = {
 
 -- Find key in current keyset
 local function ta_find(keyset, rr)
-	for i = 1, #keyset do
-		local ta = keyset[i]
+	for i, ta in ipairs(keyset) do
 		-- Match key owner and content
 		if ta.owner == rr.owner and
 		   C.kr_dnssec_key_match(ta.rdata, #ta.rdata, rr.rdata, #rr.rdata) == 0 then
@@ -88,8 +87,7 @@ local function ta_missing(keyset, ta, hold_down_time)
 end
 
 -- Plan refresh event and re-schedule itself based on the result of the callback
-local function refresh_plan(trust_anchors, timeout, refresh_cb)
-	if trust_anchors.refresh_ev ~= nil then event.cancel(trust_anchors.refresh_ev) end
+local function refresh_plan(trust_anchors, timeout, refresh_cb, priming)
 	trust_anchors.refresh_ev = event.after(timeout, function (ev)
 		resolve('.', kres.type.DNSKEY, kres.class.IN, kres.query.NO_CACHE,
 		function (pkt)
@@ -100,6 +98,10 @@ local function refresh_plan(trust_anchors, timeout, refresh_cb)
 			end
 			print('[trust_anchors] next refresh: '..next_time)
 			refresh_plan(trust_anchors, next_time, refresh_cb)
+			-- Priming query, prime root NS next
+			if priming ~= nil then
+				resolve('.', kres.type.NS, kres.class.IN)
+			end
 		end)
 	end)
 end
@@ -110,8 +112,7 @@ local function active_refresh(trust_anchors, pkt)
 	if pkt:rcode() == kres.rcode.NOERROR then
 		local records = pkt:section(kres.section.ANSWER)
 		local keyset = {}
-		for i = 1, #records do
-			local rr = records[i]
+		for i, rr in ipairs(records) do
 			if rr.type == kres.type.DNSKEY then
 				table.insert(keyset, rr)
 			end
@@ -152,32 +153,27 @@ local trust_anchors = {
 		if not new_keys then return false end
 		-- Filter TAs to be purged from the keyset (KeyRem)
 		local hold_down = trust_anchors.hold_down_time / 1000
-		local keyset_keep = {}
-		local keyset = trust_anchors.keyset
-		for i = 1, #keyset do
-			local ta = keyset[i]
+		local keyset = {}
+		for i, ta in ipairs(trust_anchors.keyset) do
 			local keep = true
 			if not ta_find(new_keys, ta) then
-				keep = ta_missing(trust_anchors, keyset, ta, hold_down)
+				keep = ta_missing(trust_anchors, trust_anchors.keyset, ta, hold_down)
 			end
 			if keep then
-				table.insert(keyset_keep, ta)
+				table.insert(keyset, ta)
 			end
 		end
-		keyset = keyset_keep
 		-- Evaluate new TAs
-		for i = 1, #new_keys do
-			local rr = new_keys[i]
-			if rr.type == kres.type.DNSKEY then
+		for i, rr in ipairs(new_keys) do
+			if rr.type == kres.type.DNSKEY and rr.rdata ~= nil then
 				ta_present(keyset, rr, hold_down, initial)
 			end
 		end
 		-- Publish active TAs
 		local store = kres.context().trust_anchors
 		C.kr_ta_clear(store)
-		if #keyset == 0 then return false end
-		for i = 1, #keyset do
-			local ta = keyset[i]
+		if next(keyset) == nil then return false end
+		for i, ta in ipairs(keyset) do
 			-- Key MAY be used as a TA only in these two states (RFC5011, 4.2)
 			if ta.state == key_state.Valid or ta.state == key_state.Missing then
 				C.kr_ta_add(store, ta.owner, ta.type, ta.ttl, ta.rdata, #ta.rdata)
@@ -198,7 +194,8 @@ local trust_anchors = {
 		if is_unmanaged then trust_anchors.file_current = nil end
 		trust_anchors.keyset = {}
 		if trust_anchors.update(new_keys, true) then
-			refresh_plan(trust_anchors, sec, active_refresh)
+			if trust_anchors.refresh_ev ~= nil then event.cancel(trust_anchors.refresh_ev) end
+			refresh_plan(trust_anchors, sec, active_refresh, true)
 		end
 	end,
 	-- Add DS/DNSKEY record(s) (unmanaged)

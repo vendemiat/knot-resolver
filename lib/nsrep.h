@@ -53,7 +53,7 @@ enum kr_ns_rep {
 typedef lru_hash(unsigned) kr_nsrep_lru_t;
 
 /* Maximum count of addresses probed in one go (last is left empty) */
-#define KR_NSREP_MAXADDR 3
+#define KR_NSREP_MAXADDR 4
 
 /**
  * Name server representation.
@@ -79,6 +79,15 @@ struct kr_nsrep
 /** @internal Address length for given family. */
 #define kr_nsrep_inaddr_len(addr) \
 	((addr).ip.sa_family == AF_INET ? sizeof(struct in_addr) : sizeof(struct in6_addr))
+
+/**
+ * Set given NS address.
+ * @param  qry      updated query
+ * @param  addr     address bytes (struct in_addr or struct in6_addr)
+ * @param  addr_len address bytes length (type will be derived from this)
+ * @return          0 or an error code
+ */
+int kr_nsrep_set(struct kr_query *qry, uint8_t *addr, size_t addr_len);
 
 /**
  * Elect best nameserver/address pair from the nsset.
