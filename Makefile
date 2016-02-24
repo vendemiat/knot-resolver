@@ -26,7 +26,9 @@ $(eval $(call find_lib,libmemcached,1.0))
 $(eval $(call find_lib,hiredis))
 $(eval $(call find_lib,socket_wrapper))
 $(eval $(call find_lib,libdnssec))
+$(eval $(call find_lib,libsystemd))
 $(eval $(call find_gopkg,geoip,github.com/abh/geoip))
+
 # Find Go compiler version
 # @note Go 1.5 support amd64 only, disabled for other architectures
 ifeq ($(ARCH),x86_64)
@@ -43,7 +45,11 @@ ifneq (,$(findstring luajit, $(lua_LIBS)))
 endif
 endif
 
-BUILD_CFLAGS += $(libknot_CFLAGS) $(libuv_CFLAGS) $(cmocka_CFLAGS) $(lua_CFLAGS) $(libdnssec_CFLAGS)
+ifdef HAS_libsystemd
+BUILD_CFLAGS += -DHAS_SYSTEMD
+endif
+
+BUILD_CFLAGS += $(libknot_CFLAGS) $(libuv_CFLAGS) $(cmocka_CFLAGS) $(lua_CFLAGS) $(libdnssec_CFLAGS) $(libsystemd_CFLAGS)
 BUILD_CFLAGS += $(addprefix -I,$(wildcard contrib/ccan/*) contrib/murmurhash3)
 
 # Overview
@@ -78,6 +84,7 @@ info:
 	$(info [$(HAS_libmemcached)] libmemcached (modules/memcached))
 	$(info [$(HAS_hiredis)] hiredis (modules/redis))
 	$(info [$(HAS_cmocka)] cmocka (tests/unit))
+	$(info [$(HAS_libsystemd)] libsystemd)
 	$(info )
 
 # Installation directories
