@@ -32,11 +32,23 @@
 #include "daemon/engine.h"
 #include "daemon/bindings.h"
 
+#if HAS_SYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
+
 /*
  * Globals
  */
 static bool g_quiet = false;
 static bool g_interactive = true;
+
+/* Signal started state to the init system. */
+static void init_signal_started(void)
+{
+#if HAS_SYSTEMD
+	sd_notify(0, "READY=1");
+#endif
+}
 
 /*
  * TTY control
@@ -213,6 +225,8 @@ static int run_worker(uv_loop_t *loop, struct engine *engine)
 			uv_listen((uv_stream_t *) &pipe, 16, tty_accept);
 		}
 	}
+
+	init_signal_started();
 	/* Run event loop */
 	uv_run(loop, UV_RUN_DEFAULT);
 	if (sock_file) {
