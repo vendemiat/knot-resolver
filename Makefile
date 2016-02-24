@@ -45,7 +45,7 @@ ifneq (,$(findstring luajit, $(lua_LIBS)))
 endif
 endif
 
-ifdef HAS_libsystemd
+ifeq ($(HAS_libsystemd), yes)
 BUILD_CFLAGS += -DHAS_SYSTEMD
 endif
 

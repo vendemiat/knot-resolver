@@ -32,7 +32,7 @@
 #include "daemon/engine.h"
 #include "daemon/bindings.h"
 
-#if HAS_SYSTEMD
+#ifdef HAS_SYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
 
@@ -45,7 +45,7 @@ static bool g_interactive = true;
 /* Signal started state to the init system. */
 static void init_signal_started(void)
 {
-#if HAS_SYSTEMD
+#ifdef HAS_SYSTEMD
 	sd_notify(0, "READY=1");
 #endif
 }
