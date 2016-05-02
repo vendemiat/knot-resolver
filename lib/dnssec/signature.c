@@ -26,10 +26,10 @@
 #include <libknot/packet/wire.h>
 #include <libknot/rrset.h>
 #include <libknot/rrtype/rrsig.h>
+#include <libknot/rrtype/ds.h>
 
 #include "lib/defines.h"
 #include "lib/utils.h"
-#include "lib/dnssec/rrtype/ds.h"
 #include "lib/dnssec/signature.h"
 
 static int authenticate_ds(const dnssec_key_t *key, dnssec_binary_t *ds_rdata, uint8_t digest_type)
@@ -69,7 +69,7 @@ int kr_authenticate_referral(const knot_rrset_t *ref, const dnssec_key_t *key)
 			.size = knot_rdata_rdlen(rd),
 			.data = knot_rdata_data(rd)
 		};
-		ret = authenticate_ds(key, &ds_rdata, _knot_ds_dtype(&ref->rrs, i));
+		ret = authenticate_ds(key, &ds_rdata, knot_ds_digest_type(&ref->rrs, i));
 		if (ret == 0) { /* Found a good DS */
 			break;
 		}
@@ -174,19 +174,14 @@ static int sign_ctx_add_records(dnssec_sign_ctx_t *ctx, const knot_rrset_t *cove
                                 uint32_t orig_ttl, int trim_labels)
 {
 	// huge block of rrsets can be optionally created
-	uint8_t *rrwf = malloc(KNOT_WIRE_MAX_PKTSIZE);
-	if (!rrwf) {
-		return KNOT_ENOMEM;
-	}
-
-	int written = knot_rrset_to_wire(covered, rrwf, KNOT_WIRE_MAX_PKTSIZE, NULL);
+	static uint8_t wire_buffer[KNOT_WIRE_MAX_PKTSIZE];
+	int written = knot_rrset_to_wire(covered, wire_buffer, sizeof(wire_buffer), NULL);
 	if (written < 0) {
-		free(rrwf);
 		return written;
 	}
 
 	/* Set original ttl. */
-	int ret = adjust_wire_ttl(rrwf, written, orig_ttl);
+	int ret = adjust_wire_ttl(wire_buffer, written, orig_ttl);
 	if (ret != 0) {
 		return ret;
 	}
@@ -194,23 +189,21 @@ static int sign_ctx_add_records(dnssec_sign_ctx_t *ctx, const knot_rrset_t *cove
 	/* RFC4035 5.3.2
 	 * Remove leftmost labels and replace them with '*.'.
 	 */
-	uint8_t *owner = rrwf;
+	uint8_t *beginp = wire_buffer;
 	if (trim_labels > 0) {
-		/**/
 		for (int i = 0; i < trim_labels; ++i) {
-			owner = (uint8_t *) knot_wire_next_label(owner, NULL);
+			assert(beginp[0]);
+			beginp = (uint8_t *) knot_wire_next_label(beginp, NULL);
 		}
-		*(--owner) = '*';
-		*(--owner) = 1;
+		*(--beginp) = '*';
+		*(--beginp) = 1;
 	}
 
-	dnssec_binary_t rrset_wire = { 0 };
-	rrset_wire.size = written - (owner - rrwf);
-	rrset_wire.data = owner;
-	int result = dnssec_sign_add(ctx, &rrset_wire);
-	free(rrwf);
-
-	return result;
+	dnssec_binary_t wire_binary = {
+		.size = written - (beginp - wire_buffer),
+		.data = beginp
+	};
+	return dnssec_sign_add(ctx, &wire_binary);
 }
 
 /*!

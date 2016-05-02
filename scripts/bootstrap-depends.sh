@@ -1,11 +1,11 @@
 #!/bin/bash  
-set -e
+#set -e
 
 CMOCKA_TAG="cmocka-0.4.1"
 CMOCKA_URL="git://git.cryptomilk.org/projects/cmocka.git"
 LIBUV_TAG="v1.x"
 LIBUV_URL="https://github.com/libuv/libuv.git"
-KNOT_TAG="v2.0.1"
+KNOT_TAG="v2.1.1"
 KNOT_URL="https://github.com/CZ-NIC/knot.git"
 GMP_TAG="6.0.0"
 GMP_URL="https://gmplib.org/download/gmp/gmp-${GMP_TAG}.tar.xz"
@@ -15,10 +15,12 @@ NETTLE_TAG="2.7.1"
 NETTLE_URL="https://ftp.gnu.org/gnu/nettle/nettle-${NETTLE_TAG}.tar.gz"
 GNUTLS_TAG="3.3.12"
 GNUTLS_URL="ftp://ftp.gnutls.org/gcrypt/gnutls/v3.3/gnutls-${GNUTLS_TAG}.tar.xz"
-LUA_TAG="v2.1"
-LUA_URL="http://luajit.org/git/luajit-2.0.git"
-CWRAP_TAG="master"
-CWRAP_URL="git://git.samba.org/socket_wrapper.git"
+LUA_TAG="v2.1.0-beta1"
+LUA_URL="https://github.com/LuaJIT/LuaJIT.git"
+HIREDIS_TAG="v0.13.3"
+HIREDIS_URL="https://github.com/redis/hiredis.git"
+LIBMEMCACHED_TAG="1.0.18"
+LIBMEMCACHED_URL="https://launchpad.net/libmemcached/1.0/1.0.18/+download/libmemcached-1.0.18.tar.gz"
 
 # prepare install prefix
 PREFIX=${1}; [ -z ${PREFIX} ] && export PREFIX="${HOME}/.local"
@@ -42,7 +44,7 @@ function fetch_pkg {
 		[ ! -e $1 ] && git clone "$2" $1 &> /dev/null
 		cd $1; git checkout $3 &> /dev/null; cd -
 	else
-		[ ! -f $1.tar.${2##*.} ] && curl "$2" > $1.tar.${2##*.}
+		[ ! -f $1.tar.${2##*.} ] && curl -L "$2" > $1.tar.${2##*.}
 		tar xf $1.tar.${2##*.}
 	fi
 	cd $1
@@ -78,42 +80,36 @@ function pkg {
 }
 
 # travis-specific
-PIP_PKGS="${TRAVIS_BUILD_DIR}/tests/pydnstest/requirements.txt cpp-coveralls Jinja2"
+PIP_PKGS="dnspython==1.11 cpp-coveralls Jinja2"
 if [ "${TRAVIS_OS_NAME}" == "osx" ]; then
 	DEPEND_CACHE="https://dl.dropboxusercontent.com/u/2255176/resolver-${TRAVIS_OS_NAME}-cache.tar.gz"
 	curl "${DEPEND_CACHE}" > cache.tar.gz && tar -xz -C ${HOME} -f cache.tar.gz || true
 	brew update
-	brew install --force makedepend python libtasn1 || true
+	brew install --force makedepend python hiredis libmemcached || true
 	brew link --overwrite python || true
 	pip install --upgrade pip || true
-	pip install -r ${PIP_PKGS}
-	pkg cwrap ${CWRAP_URL} ${CWRAP_TAG} lib/pkgconfig/socket_wrapper.pc
+	pip install ${PIP_PKGS}
 fi
 if [ "${TRAVIS_OS_NAME}" == "linux" ]; then
-	pkg cwrap ${CWRAP_URL} ${CWRAP_TAG} lib/pkgconfig/socket_wrapper.pc
-	pip install --user ${USER} -r ${PIP_PKGS} || true
+	pip install --user ${USER} ${PIP_PKGS} || true
 	rm ${HOME}/.cache/pip/log/debug.log || true
+	pkg hiredis ${HIREDIS_URL} ${HIREDIS_TAG} include/hiredis/hiredis.h install PREFIX=${PREFIX}
+	pkg libmemcached ${LIBMEMCACHED_URL} ${LIBMEMCACHED_TAG} include/libmemcached/memcached.h
 fi
 
-# gnutls + dependencies
 pkg gmp ${GMP_URL} ${GMP_TAG} include/gmp.h --disable-static
 pkg nettle ${NETTLE_URL} ${NETTLE_TAG} include/nettle \
 	--disable-documentation --with-lib-path=${PREFIX}/lib --with-include-path=${PREFIX}/include
 export GMP_CFLAGS="-I${PREFIX}/include"
 export GMP_LIBS="-L${PREFIX}/lib -lgmp"
 pkg gnutls ${GNUTLS_URL} ${GNUTLS_TAG} include/gnutls \
-	--disable-tests --disable-doc --disable-valgrind-tests --disable-static
-# jansson
+	--disable-tests --disable-doc --disable-valgrind-tests --disable-static --with-included-libtasn1
 pkg jansson ${JANSSON_URL} ${JANSSON_TAG} include/jansson.h --disable-static
-# libknot
 pkg libknot ${KNOT_URL} ${KNOT_TAG} include/libknot \
 	--disable-static --with-lmdb=no --disable-fastparser --disable-daemon --disable-utilities --disable-documentation
-# cmocka
 pkg cmocka ${CMOCKA_URL} ${CMOCKA_TAG} include/cmocka.h
-# libuv
 pkg libuv ${LIBUV_URL} ${LIBUV_TAG} include/uv.h --disable-static
-# luajit
-pkg lua ${LUA_URL} ${LUA_TAG} lib/pkgconfig/luajit.pc install LDFLAGS=-lm PREFIX=${PREFIX}
+pkg lua ${LUA_URL} ${LUA_TAG} lib/pkgconfig/luajit.pc install BUILDMODE=dynamic LDFLAGS=-lm PREFIX=${PREFIX}
 
 # remove on successful build
 rm -rf ${BUILD_DIR}

@@ -81,15 +81,17 @@ local function rpz_parse(action, path)
 		['\012rpz-tcp-only\0'] = policy.TC,
 		-- Policy triggers @NYI@
 	}
-	local parser = require('zonefile').parser(function (p)
-		local name = ffi.string(p.r_owner, p.r_owner_length)
-		local action = ffi.string(p.r_data, p.r_data_length)
+	local parser = require('zonefile').new()
+	if not parser:open(path) then error(string.format('failed to parse "%s"', path)) end
+	while parser:parse() do
+		local name = ffi.string(parser.r_owner, parser.r_owner_length)
+		local action = ffi.string(parser.r_data, parser.r_data_length)
 		rules[name] = action_map[action]
-	end, function (p)
-		print(string.format('[policy.rpz] %s: line %d: %s', path,
-			tonumber(p.line_counter), p:last_error()))
-	end)
-	parser:parse_file(path)
+		-- Warn when NYI
+		if #name > 1 and not action_map[action] then
+			print(string.format('[ rpz ] %s:%d: unsupported policy action', path, tonumber(parser.line_counter)))
+		end
+	end
 	return rules
 end
 
@@ -167,10 +169,11 @@ function policy.add(policy, rule)
 end
 
 -- Convert list of string names to domain names
-function policy.to_domains(names)
+function policy.todnames(names)
 	for i, v in ipairs(names) do
 		names[i] = kres.str2dname(v)
 	end
+	return names
 end
 
 -- RFC1918 Private, local, broadcast, test and special zones 
@@ -211,7 +214,7 @@ local private_zones = {
 	'b.e.f.ip6.arpa.',
 	'8.b.d.0.1.0.0.2.ip6.arpa',
 }
-policy.to_domains(private_zones)
+policy.todnames(private_zones)
 
 -- @var Default rules
 policy.rules = { policy.suffix_common(policy.DENY, private_zones, '\4arpa\0') }

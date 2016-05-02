@@ -18,9 +18,15 @@
 #include <string.h>
 #include <getopt.h>
 #include <uv.h>
+#include <assert.h>
+#include <contrib/cleanup.h>
+#include <contrib/ucw/mempool.h>
+#include <contrib/ccan/asprintf/asprintf.h>
+#include <libknot/error.h>
+#ifdef HAS_SYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
 
-#include "contrib/ucw/mempool.h"
-#include "contrib/ccan/asprintf/asprintf.h"
 #include "lib/defines.h"
 #include "lib/resolve.h"
 #include "lib/dnssec.h"
@@ -32,7 +38,8 @@
 /*
  * Globals
  */
-static int g_interactive = 1;
+static bool g_quiet = false;
+static bool g_interactive = true;
 
 /*
  * TTY control
@@ -66,11 +73,23 @@ static void tty_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
 		if (lua_gettop(L) > 0) {
 			message = lua_tostring(L, -1);
 		}
+		/* Log to remote socket if connected */
+		const char *delim = g_quiet ? "" : "> ";
 		if (stream_fd != STDIN_FILENO) {
 			fprintf(stdout, "%s\n", cmd); /* Duplicate command to logs */
-			fprintf(out, "%s\n> ", message); /* Duplicate output to sender */
+			if (message)
+				fprintf(out, "%s", message); /* Duplicate output to sender */
+			if (message || !g_quiet)
+				fprintf(out, "\n");
+			fprintf(out, "%s", delim);
 		}
-		fprintf(ret ? stderr : stdout, "%s\n> ", message);
+		/* Log to standard streams */
+		FILE *fp_out = ret ? stderr : stdout;
+		if (message)
+			fprintf(fp_out, "%s", message);
+		if (message || !g_quiet)
+			fprintf(fp_out, "\n");
+		fprintf(fp_out, "%s", delim);
 		lua_settop(L, 0);
 		free(buf->base);
 	}
@@ -99,8 +118,10 @@ static void tty_accept(uv_stream_t *master, int status)
 		 client->data = master->data;
 		 uv_read_start((uv_stream_t *)client, tty_alloc, tty_read);
 		 /* Write command line */
-		 uv_buf_t buf = { "> ", 2 };
-		 uv_try_write((uv_stream_t *)client, &buf, 1);
+		 if (!g_quiet) {
+		 	uv_buf_t buf = { "> ", 2 };
+		 	uv_try_write((uv_stream_t *)client, &buf, 1);
+		 }
 	}
 }
 
@@ -130,9 +151,11 @@ static void help(int argc, char *argv[])
 	printf("Usage: %s [parameters] [rundir]\n", argv[0]);
 	printf("\nParameters:\n"
 	       " -a, --addr=[addr]    Server address (default: localhost#53).\n"
+	       " -S, --fd=[fd]        Listen on given fd (handed out by supervisor).\n"
 	       " -c, --config=[path]  Config file path (relative to [rundir]) (default: config).\n"
 	       " -k, --keyfile=[path] File containing trust anchors (DS or DNSKEY).\n"
 	       " -f, --forks=N        Start N forks sharing the configuration.\n"
+	       " -q, --quiet          Quiet output, no prompt in interactive mode.\n"
 	       " -v, --verbose        Run in verbose mode.\n"
 	       " -V, --version        Print version of the server.\n"
 	       " -h, --help           Print help and usage.\n"
@@ -140,7 +163,7 @@ static void help(int argc, char *argv[])
 	       " [rundir]             Path to the working directory (default: .)\n");
 }
 
-static struct worker_ctx *init_worker(uv_loop_t *loop, struct engine *engine, mm_ctx_t *pool, int worker_id)
+static struct worker_ctx *init_worker(uv_loop_t *loop, struct engine *engine, knot_mm_t *pool, int worker_id, int worker_count)
 {
 	/* Load bindings */
 	engine_lualib(engine, "modules", lib_modules);
@@ -155,6 +178,8 @@ static struct worker_ctx *init_worker(uv_loop_t *loop, struct engine *engine, mm
 		return NULL;
 	}
 	memset(worker, 0, sizeof(*worker));
+	worker->id = worker_id;
+	worker->count = worker_count;
 	worker->engine = engine,
 	worker->loop = loop;
 	loop->data = worker;
@@ -165,6 +190,8 @@ static struct worker_ctx *init_worker(uv_loop_t *loop, struct engine *engine, mm
 	lua_getglobal(engine->L, "worker");
 	lua_pushnumber(engine->L, worker_id);
 	lua_setfield(engine->L, -2, "id");
+	lua_pushnumber(engine->L, worker_count);
+	lua_setfield(engine->L, -2, "count");
 	lua_pop(engine->L, 1);
 	return worker;
 }
@@ -177,7 +204,8 @@ static int run_worker(uv_loop_t *loop, struct engine *engine)
 	uv_pipe_init(loop, &pipe, 0);
 	pipe.data = engine;
 	if (g_interactive) {
-		printf("[system] interactive mode\n> ");
+		if (!g_quiet)
+			printf("[system] interactive mode\n> ");
 		fflush(stdout);
 		uv_pipe_open(&pipe, 0);
 		uv_read_start((uv_stream_t*) &pipe, tty_alloc, tty_read);
@@ -189,6 +217,10 @@ static int run_worker(uv_loop_t *loop, struct engine *engine)
 			uv_listen((uv_stream_t *) &pipe, 16, tty_accept);
 		}
 	}
+	/* Notify supervisor. */
+#ifdef HAS_SYSTEMD
+	sd_notify(0, "READY=1");
+#endif
 	/* Run event loop */
 	uv_run(loop, UV_RUN_DEFAULT);
 	if (sock_file) {
@@ -201,58 +233,88 @@ int main(int argc, char **argv)
 {
 	int forks = 1;
 	array_t(char*) addr_set;
+	array_t(int) fd_set;
 	array_init(addr_set);
+	array_init(fd_set);
 	char *keyfile = NULL;
 	const char *config = NULL;
-	static char keyfile_buf[PATH_MAX + 1];
+	char *keyfile_buf = NULL;
 
 	/* Long options. */
 	int c = 0, li = 0, ret = 0;
 	struct option opts[] = {
 		{"addr", required_argument,   0, 'a'},
+		{"fd",   required_argument,   0, 'S'},
 		{"config", required_argument, 0, 'c'},
 		{"keyfile",required_argument, 0, 'k'},
 		{"forks",required_argument,   0, 'f'},
 		{"verbose",    no_argument,   0, 'v'},
+		{"quiet",      no_argument,   0, 'q'},
 		{"version",   no_argument,    0, 'V'},
 		{"help",      no_argument,    0, 'h'},
 		{0, 0, 0, 0}
 	};
-	while ((c = getopt_long(argc, argv, "a:c:f:k:vVh", opts, &li)) != -1) {
+	while ((c = getopt_long(argc, argv, "a:S:c:f:k:vqVh", opts, &li)) != -1) {
 		switch (c)
 		{
 		case 'a':
 			array_push(addr_set, optarg);
 			break;
+		case 'S':
+			array_push(fd_set,  atoi(optarg));
+			break;
 		case 'c':
 			config = optarg;
 			break;
 		case 'f':
-			g_interactive = 0;
+			g_interactive = false;
 			forks = atoi(optarg);
 			if (forks == 0) {
-				log_error("[system] error '-f' requires number, not '%s'\n", optarg);
+				kr_log_error("[system] error '-f' requires number, not '%s'\n", optarg);
 				return EXIT_FAILURE;
 			}
 #if (!defined(UV_VERSION_HEX)) || (!defined(SO_REUSEPORT))
 			if (forks > 1) {
-				log_error("[system] libuv 1.7+ is required for SO_REUSEPORT support, multiple forks not supported\n");
+				kr_log_error("[system] libuv 1.7+ is required for SO_REUSEPORT support, multiple forks not supported\n");
 				return EXIT_FAILURE;
 			}
 #endif
 			break;
 		case 'k':
-			keyfile = realpath(optarg, keyfile_buf);
-			if (!keyfile || access(optarg, R_OK|W_OK) != 0) {
-				log_error("[system] keyfile '%s': not readable/writeable\n", optarg);
+			keyfile_buf = malloc(PATH_MAX);
+			assert(keyfile_buf);
+			/* Check if the path is absolute */
+			if (optarg[0] == '/') {
+				keyfile = strdup(optarg);
+			} else {
+				/* Construct absolute path, the file may not exist */
+				keyfile = realpath(".", keyfile_buf);
+				if (keyfile) {
+					int len = strlen(keyfile);
+					int namelen = strlen(optarg);
+					if (len + namelen < PATH_MAX - 1) {
+						keyfile[len] = '/';
+						memcpy(keyfile + len + 1, optarg, namelen + 1);
+						keyfile = strdup(keyfile); /* Duplicate */
+					} else {
+						keyfile = NULL; /* Invalidate */
+					}
+				}
+			}
+			free(keyfile_buf);
+			if (!keyfile) {
+				kr_log_error("[system] keyfile '%s': not writeable\n", optarg);
 				return EXIT_FAILURE;
 			}
 			break;
 		case 'v':
-			log_debug_enable(true);
+			kr_debug_set(true);
+			break;
+		case 'q':
+			g_quiet = true;
 			break;
 		case 'V':
-			log_info("%s, version %s\n", "Knot DNS Resolver", PACKAGE_VERSION);
+			kr_log_info("%s, version %s\n", "Knot DNS Resolver", PACKAGE_VERSION);
 			return EXIT_SUCCESS;
 		case 'h':
 		case '?':
@@ -264,21 +326,30 @@ int main(int argc, char **argv)
 		}
 	}
 
+#ifdef HAS_SYSTEMD
+	/* Accept passed sockets from systemd supervisor. */
+	int sd_nsocks = sd_listen_fds(0);
+	for (int i = 0; i < sd_nsocks; ++i) {
+		int fd = SD_LISTEN_FDS_START + i;
+		array_push(fd_set, fd);
+	}
+#endif
+
 	/* Switch to rundir. */
 	if (optind < argc) {
 		const char *rundir = argv[optind];
 		if (access(rundir, W_OK) != 0) {
-			log_error("[system] rundir '%s': %s\n", rundir, strerror(errno));
+			kr_log_error("[system] rundir '%s': %s\n", rundir, strerror(errno));
 			return EXIT_FAILURE;
 		}
 		ret = chdir(rundir);
 		if (ret != 0) {
-			log_error("[system] rundir '%s': %s\n", rundir, strerror(errno));
+			kr_log_error("[system] rundir '%s': %s\n", rundir, strerror(errno));
 			return EXIT_FAILURE;
 		}
-		if(config && access(config, R_OK) != 0) {
-			log_error("[system] rundir '%s'\n", rundir);
-			log_error("[system] config '%s': %s\n", config, strerror(errno));
+		if(config && strcmp(config, "-") != 0 && access(config, R_OK) != 0) {
+			kr_log_error("[system] rundir '%s'\n", rundir);
+			kr_log_error("[system] config '%s': %s\n", config, strerror(errno));
 			return EXIT_FAILURE;
 		}
 	}
@@ -286,6 +357,7 @@ int main(int argc, char **argv)
 	kr_crypto_init();
 
 	/* Fork subprocesses if requested */
+	int fork_count = forks;
 	while (--forks > 0) {
 		int pid = fork();
 		if (pid < 0) {
@@ -307,21 +379,29 @@ int main(int argc, char **argv)
 	uv_signal_start(&sigint, signal_handler, SIGINT);
 	uv_signal_start(&sigterm, signal_handler, SIGTERM);
 	/* Create a server engine. */
-	mm_ctx_t pool = {
+	knot_mm_t pool = {
 		.ctx = mp_new (4096),
-		.alloc = (mm_alloc_t) mp_alloc
+		.alloc = (knot_mm_alloc_t) mp_alloc
 	};
 	struct engine engine;
 	ret = engine_init(&engine, &pool);
 	if (ret != 0) {
-		log_error("[system] failed to initialize engine: %s\n", kr_strerror(ret));
+		kr_log_error("[system] failed to initialize engine: %s\n", kr_strerror(ret));
 		return EXIT_FAILURE;
 	}
 	/* Create worker */
-	struct worker_ctx *worker = init_worker(loop, &engine, &pool, forks);
+	struct worker_ctx *worker = init_worker(loop, &engine, &pool, forks, fork_count);
 	if (!worker) {
-		log_error("[system] not enough memory\n");
+		kr_log_error("[system] not enough memory\n");
 		return EXIT_FAILURE;
+	}
+	/* Bind to passed fds and run */
+	for (size_t i = 0; i < fd_set.len; ++i) {
+		ret = network_listen_fd(&engine.net, fd_set.at[i]);
+		if (ret != 0) {
+			kr_log_error("[system] listen on fd=%d %s\n", fd_set.at[i], kr_strerror(ret));
+			ret = EXIT_FAILURE;
+		}
 	}
 	/* Bind to sockets and run */
 	for (size_t i = 0; i < addr_set.len; ++i) {
@@ -329,7 +409,7 @@ int main(int argc, char **argv)
 		const char *addr = set_addr(addr_set.at[i], &port);
 		ret = network_listen(&engine.net, addr, (uint16_t)port, NET_UDP|NET_TCP);
 		if (ret != 0) {
-			log_error("[system] bind to '%s#%d' %s\n", addr, port, knot_strerror(ret));
+			kr_log_error("[system] bind to '%s#%d' %s\n", addr, port, kr_strerror(ret));
 			ret = EXIT_FAILURE;
 		}
 	}
@@ -340,7 +420,7 @@ int main(int argc, char **argv)
 			if (keyfile) {
 				auto_free char *cmd = afmt("trust_anchors.file = '%s'", keyfile);
 				if (!cmd) {
-					log_error("[system] not enough memory\n");
+					kr_log_error("[system] not enough memory\n");
 					return EXIT_FAILURE;
 				}
 				engine_cmd(&engine, cmd);

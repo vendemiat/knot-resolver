@@ -21,6 +21,21 @@
 #include <libknot/dname.h>
 #include <libknot/rrset.h>
 
+/* Function attributes */
+#if __GNUC__ >= 4
+#define KR_EXPORT __attribute__ ((visibility ("default")))
+#define KR_CONST __attribute__((__const__))
+#define KR_PURE __attribute__((__pure__))
+#define KR_NORETURN __attribute__((__noreturn__))
+#define KR_COLD __attribute__((__cold__))
+#else
+#define KR_EXPORT
+#define KR_CONST
+#define KR_PURE
+#define KR_NORETURN
+#define KR_COLD
+#endif
+
 /*
  * Error codes.
  */
@@ -38,6 +53,7 @@ static inline int __attribute__((__cold__)) kr_error(int x) {
 #define KR_CONN_RTT_MAX 3000 /* Timeout for network activity */
 #define KR_CONN_RETRY 300    /* Retry interval for network activity */
 #define KR_ITER_LIMIT 50     /* Built-in iterator limit */
+#define KR_CNAME_CHAIN_LIMIT 40 /* Built-in maximum CNAME chain length */
 
 /*
  * Defines.

@@ -26,6 +26,7 @@
 #include <libknot/rrtype/aaaa.h>
 #include <ccan/json/json.h>
 #include <ucw/mempool.h>
+#include <contrib/cleanup.h>
 
 #include "daemon/engine.h"
 #include "lib/zonecut.h"
@@ -213,7 +214,13 @@ static int query(knot_layer_t *ctx, knot_pkt_t *pkt)
 static int parse_addr_str(struct sockaddr_storage *sa, const char *addr)
 {
 	int family = strchr(addr, ':') ? AF_INET6 : AF_INET;
-	return sockaddr_set(sa, family, addr, 0);
+	memset(sa, 0, sizeof(struct sockaddr_storage));
+	sa->ss_family = family;
+	char *addr_bytes = (char *)kr_inaddr((struct sockaddr *)sa);
+	if (inet_pton(family, addr, addr_bytes) < 1) {
+		return kr_error(EILSEQ);
+	}
+	return 0;
 }
 
 static int add_pair(struct kr_zonecut *hints, const char *name, const char *addr)
@@ -230,13 +237,13 @@ static int add_pair(struct kr_zonecut *hints, const char *name, const char *addr
 		return kr_error(EINVAL);
 	}
 
-	/* Build rdata */
-	size_t addr_len = 0;
-	uint8_t *raw_addr = sockaddr_raw(&ss, &addr_len);
-	knot_rdata_t rdata[knot_rdata_array_size(addr_len)];
-	knot_rdata_init(rdata, addr_len, raw_addr, 0);
-
-	return kr_zonecut_add(hints, key, rdata);
+	/* Build RDATA */
+	size_t addr_len = kr_inaddr_len((struct sockaddr *)&ss);
+	const uint8_t *raw_addr = (const uint8_t *)kr_inaddr((struct sockaddr *)&ss);
+	/* @warning _NOT_ thread-safe */
+	static knot_rdata_t rdata_arr[RDATA_ARR_MAX];
+	knot_rdata_init(rdata_arr, addr_len, raw_addr, 0);
+	return kr_zonecut_add(hints, key, rdata_arr);
 }
 
 static int load_map(struct kr_zonecut *hints, FILE *fp)
@@ -275,11 +282,11 @@ static int load(struct kr_module *module, const char *path)
 	}
 
 	/* Create pool and copy itself */
-	mm_ctx_t _pool = {
+	knot_mm_t _pool = {
 		.ctx = mp_new(4096),
-		.alloc = (mm_alloc_t) mp_alloc
+		.alloc = (knot_mm_alloc_t) mp_alloc
 	};
-	mm_ctx_t *pool = mm_alloc(&_pool, sizeof(*pool));
+	knot_mm_t *pool = mm_alloc(&_pool, sizeof(*pool));
 	if (!pool) {
 		return kr_error(ENOMEM);
 	}
@@ -322,14 +329,15 @@ static char* hint_set(void *env, struct kr_module *module, const char *args)
 	}
 
 	char *result = NULL;
-	asprintf(&result, "{ \"result\": %s", ret == 0 ? "true" : "false");
+	if (-1 == asprintf(&result, "{ \"result\": %s }", ret == 0 ? "true" : "false"))
+		result = NULL;
 	return result;
 }
 
 /** @internal Pack address list into JSON array. */
 static JsonNode *pack_addrs(pack_t *pack)
 {
-	char buf[SOCKADDR_STRLEN];
+	char buf[INET6_ADDRSTRLEN];
 	JsonNode *root = json_mkarray();
 	uint8_t *addr = pack_head(*pack);
 	while (addr != pack_tail(*pack)) {
@@ -430,6 +438,7 @@ static char* hint_root(void *env, struct kr_module *module, const char *args)
  * Module implementation.
  */
 
+KR_EXPORT
 const knot_layer_api_t *hints_layer(struct kr_module *module)
 {
 	static knot_layer_api_t _layer = {
@@ -441,12 +450,14 @@ const knot_layer_api_t *hints_layer(struct kr_module *module)
 	return &_layer;
 }
 
+KR_EXPORT
 int hints_init(struct kr_module *module)
 {
 	module->data = NULL;
 	return 0;
 }
 
+KR_EXPORT
 int hints_config(struct kr_module *module, const char *conf)
 {
 	unload(module);
@@ -456,12 +467,14 @@ int hints_config(struct kr_module *module, const char *conf)
 	return load(module, conf);
 }
 
+KR_EXPORT
 int hints_deinit(struct kr_module *module)
 {
 	unload(module);
 	return kr_ok();
 }
 
+KR_EXPORT
 struct kr_prop *hints_props(void)
 {
 	static struct kr_prop prop_list[] = {

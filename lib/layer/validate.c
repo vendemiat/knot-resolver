@@ -23,10 +23,10 @@
 #include <libknot/packet/wire.h>
 #include <libknot/rrtype/rdname.h>
 #include <libknot/rrtype/rrsig.h>
+#include <dnssec/error.h>
 
 #include "lib/dnssec/nsec.h"
 #include "lib/dnssec/nsec3.h"
-#include "lib/dnssec/packet/pkt.h"
 #include "lib/dnssec.h"
 #include "lib/layer.h"
 #include "lib/resolve.h"
@@ -37,36 +37,62 @@
 
 #define DEBUG_MSG(qry, fmt...) QRDEBUG(qry, "vldr", fmt)
 
-/** @internal Baton for validate_section */
-struct stash_baton {
-	const knot_pkt_t *pkt;
-	knot_section_t section_id;
-	const knot_rrset_t *keys;
-	const knot_dname_t *zone_name;
-	uint32_t timestamp;
-	bool has_nsec3;
-	int result;
-};
+/**
+ * Search in section for given type.
+ * @param sec  Packet section.
+ * @param type Type to search for.
+ * @return     True if found.
+ */
+static bool section_has_type(const knot_pktsection_t *sec, uint16_t type)
+{
+	if (!sec) {
+		return false;
+	}
+
+	for (unsigned i = 0; i < sec->count; ++i) {
+		const knot_rrset_t *rr = knot_pkt_rr(sec, i);
+		if (rr->type == type) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool pkt_has_type(const knot_pkt_t *pkt, uint16_t type)
+{
+	if (!pkt) {
+		return false;
+	}
+
+	if (section_has_type(knot_pkt_section(pkt, KNOT_ANSWER), type)) {
+		return true;
+	}
+	if (section_has_type(knot_pkt_section(pkt, KNOT_AUTHORITY), type)) {
+		return true;
+	}
+	return section_has_type(knot_pkt_section(pkt, KNOT_ADDITIONAL), type);
+}
 
 static int validate_rrset(const char *key, void *val, void *data)
 {
 	knot_rrset_t *rr = val;
-	struct stash_baton *baton = data;
-
-	if (baton->result != 0) {
-		return baton->result;
+	kr_rrset_validation_ctx_t *vctx = data;
+	if (vctx->result != 0) {
+		return vctx->result;
 	}
-	baton->result = kr_rrset_validate(baton->pkt, baton->section_id, rr,
-	                                  baton->keys, baton->zone_name,
-	                                  baton->timestamp, baton->has_nsec3);
-	return baton->result;
+
+	return kr_rrset_validate(vctx, rr);
 }
 
-static int validate_section(struct kr_query *qry, knot_pkt_t *answer,
-                            knot_section_t section_id, mm_ctx_t *pool,
-                            bool has_nsec3)
+static int validate_section(kr_rrset_validation_ctx_t *vctx, knot_mm_t *pool)
 {
-	const knot_pktsection_t *sec = knot_pkt_section(answer, section_id);
+	if (!vctx) {
+		return kr_error(EINVAL);
+	}
+
+	const knot_pktsection_t *sec = knot_pkt_section(vctx->pkt,
+							vctx->section_id);
 	if (!sec) {
 		return kr_ok();
 	}
@@ -84,11 +110,11 @@ static int validate_section(struct kr_query *qry, knot_pkt_t *answer,
 		if (rr->type == KNOT_RRTYPE_RRSIG) {
 			continue;
 		}
-		if ((rr->type == KNOT_RRTYPE_NS) && (section_id == KNOT_AUTHORITY)) {
+		if ((rr->type == KNOT_RRTYPE_NS) && (vctx->section_id == KNOT_AUTHORITY)) {
 			continue;
 		}
 		/* Only validate answers from current cut, records above the cut are stripped. */
-		if (section_id == KNOT_ANSWER && !knot_dname_in(qry->zone_cut.name, rr->owner)) {
+		if (!knot_dname_in(vctx->zone_name, rr->owner)) {
 			continue;
 		}
 		ret = kr_rrmap_add(&stash, rr, 0, pool);
@@ -97,42 +123,64 @@ static int validate_section(struct kr_query *qry, knot_pkt_t *answer,
 		}
 	}
 
-	struct stash_baton baton = {
-		.pkt = answer,
-		.section_id = section_id,
-		.keys = qry->zone_cut.key,
-		/* Can't use qry->zone_cut.name directly, as this name can
-		 * change when updating cut information before validation.
-		 */
-		.zone_name = qry->zone_cut.key ? qry->zone_cut.key->owner : NULL,
-		.timestamp = qry->timestamp.tv_sec,
-		.has_nsec3 = has_nsec3,
-		.result = 0
-	};
+	/* Can't use qry->zone_cut.name directly, as this name can
+	 * change when updating cut information before validation.
+	 */
+	vctx->zone_name = vctx->keys ? vctx->keys->owner  : NULL;
 
-	ret = map_walk(&stash, &validate_rrset, &baton);
+	ret = map_walk(&stash, &validate_rrset, vctx);
 	if (ret != 0) {
 		return ret;
 	}
-	ret = baton.result;
+	ret = vctx->result;
 
 fail:
 	return ret;
 }
 
-static int validate_records(struct kr_query *qry, knot_pkt_t *answer, mm_ctx_t *pool, bool has_nsec3)
+static int validate_records(struct kr_query *qry, knot_pkt_t *answer, knot_mm_t *pool, bool has_nsec3)
 {
 	if (!qry->zone_cut.key) {
 		DEBUG_MSG(qry, "<= no DNSKEY, can't validate\n");
 		return kr_error(EBADMSG);
 	}
 
-	int ret = validate_section(qry, answer, KNOT_ANSWER, pool, has_nsec3);
+	kr_rrset_validation_ctx_t vctx = {
+		.pkt		= answer,
+		.section_id	= KNOT_ANSWER,
+		.keys		= qry->zone_cut.key,
+		.zone_name	= qry->zone_cut.name,
+		.timestamp	= qry->timestamp.tv_sec,
+		.has_nsec3	= has_nsec3,
+		.flags		= 0,
+		.result		= 0
+	};
+
+	int ret = validate_section(&vctx, pool);
 	if (ret != 0) {
 		return ret;
 	}
 
-	return validate_section(qry, answer, KNOT_AUTHORITY, pool, has_nsec3);
+	uint32_t an_flags = vctx.flags;
+	vctx.section_id   = KNOT_AUTHORITY;
+	/* zone_name can be changed by validate_section(), restore it */
+	vctx.zone_name	  = qry->zone_cut.name;
+	vctx.flags	  = 0;
+	vctx.result	  = 0;
+
+	ret = validate_section(&vctx, pool);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* Records were validated.
+	 * If there is wildcard expansion in answer, flag the query.
+         */
+	if (an_flags & KR_DNSSEC_VFLG_WEXPAND) {
+		qry->flags |= QUERY_DNSSEC_WEXPAND;
+	}
+
+	return ret;
 }
 
 static int validate_keyset(struct kr_query *qry, knot_pkt_t *answer, bool has_nsec3)
@@ -165,13 +213,28 @@ static int validate_keyset(struct kr_query *qry, knot_pkt_t *answer, bool has_ns
 
 	/* Check if there's a key for current TA. */
 	if (updated_key && !(qry->flags & QUERY_CACHED)) {
-		int ret = kr_dnskeys_trusted(answer, KNOT_ANSWER, qry->zone_cut.key,
-		                             qry->zone_cut.trust_anchor, qry->zone_cut.name,
-		                             qry->timestamp.tv_sec, has_nsec3);
+
+		kr_rrset_validation_ctx_t vctx = {
+			.pkt		= answer,
+			.section_id	= KNOT_ANSWER,
+			.keys		= qry->zone_cut.key,
+			.zone_name	= qry->zone_cut.name,
+			.timestamp	= qry->timestamp.tv_sec,
+			.has_nsec3	= has_nsec3,
+			.flags		= 0,
+			.result		= 0
+		};
+		int ret = kr_dnskeys_trusted(&vctx, qry->zone_cut.trust_anchor);
 		if (ret != 0) {
 			knot_rrset_free(&qry->zone_cut.key, qry->zone_cut.pool);
 			return ret;
 		}
+
+		if (vctx.flags & KR_DNSSEC_VFLG_WEXPAND)
+		{
+			qry->flags |= QUERY_DNSSEC_WEXPAND;
+		}
+
 	}
 	return kr_ok();
 }
@@ -202,7 +265,7 @@ static knot_rrset_t *update_ds(struct kr_zonecut *cut, const knot_pktsection_t *
 	return new_ds;	
 }
 
-static int update_parent(struct kr_query *qry, uint16_t answer_type)
+static int update_parent_keys(struct kr_query *qry, uint16_t answer_type)
 {
 	struct kr_query *parent = qry->parent;
 	assert(parent);
@@ -216,9 +279,14 @@ static int update_parent(struct kr_query *qry, uint16_t answer_type)
 		break;
 	case KNOT_RRTYPE_DS:
 		DEBUG_MSG(qry, "<= parent: updating DS\n");
-		parent->zone_cut.trust_anchor = knot_rrset_copy(qry->zone_cut.trust_anchor, parent->zone_cut.pool);
-		if (!parent->zone_cut.trust_anchor) {
-			return KNOT_STATE_FAIL;
+		if (qry->flags & QUERY_DNSSEC_INSECURE) { /* DS non-existence proven. */
+			parent->flags &= ~QUERY_DNSSEC_WANT;
+			parent->flags |= QUERY_DNSSEC_INSECURE;
+		} else { /* DS existence proven. */
+			parent->zone_cut.trust_anchor = knot_rrset_copy(qry->zone_cut.trust_anchor, parent->zone_cut.pool);
+			if (!parent->zone_cut.trust_anchor) {
+				return KNOT_STATE_FAIL;
+			}
 		}
 		break;
 	default: break;
@@ -246,14 +314,17 @@ static int update_delegation(struct kr_request *req, struct kr_query *qry, knot_
 
 	/* No DS provided, check for proof of non-existence. */
 	int ret = 0;
+	const knot_dname_t *proved_name = knot_pkt_qname(answer);
 	knot_rrset_t *new_ds = update_ds(cut, knot_pkt_section(answer, section));
 	if (!new_ds) {
-		if (has_nsec3) {
-			ret = kr_nsec3_no_data_response_check(answer, section,
-			      qry->zone_cut.name, KNOT_RRTYPE_DS);
+		if (!has_nsec3) {
+			ret = kr_nsec_existence_denial(answer, KNOT_AUTHORITY, proved_name, KNOT_RRTYPE_DS);
 		} else {
-			ret = kr_nsec_no_data_response_check(answer, section,
-			      qry->zone_cut.name, KNOT_RRTYPE_DS);
+			ret = kr_nsec3_no_data(answer, KNOT_AUTHORITY, proved_name, KNOT_RRTYPE_DS);
+			if (ret == kr_error(DNSSEC_NOT_FOUND)) {
+				/* Not bogus, but going insecure */
+				ret = 0;
+			}
 		}
 		if (ret != 0) {
 			DEBUG_MSG(qry, "<= bogus proof of DS non-existence\n");
@@ -274,10 +345,6 @@ static int update_delegation(struct kr_request *req, struct kr_query *qry, knot_
 
 static const knot_dname_t *signature_authority(knot_pkt_t *pkt)
 {
-	/* Can't find signer for RRSIGs, bail out. */
-	if (knot_pkt_qtype(pkt) == KNOT_RRTYPE_RRSIG) {
-		return NULL;
-	}
 	for (knot_section_t i = KNOT_ANSWER; i <= KNOT_AUTHORITY; ++i) {
 		const knot_pktsection_t *sec = knot_pkt_section(pkt, i);
 		for (unsigned k = 0; k < sec->count; ++k) {
@@ -315,17 +382,19 @@ static int validate(knot_layer_t *ctx, knot_pkt_t *pkt)
 
 	/* Track difference between current TA and signer name.
 	 * This indicates that the NS is auth for both parent-child, and we must update DS/DNSKEY to validate it.
-	 * @todo: This has to be checked here before we put the data into packet, there is no "DEFER" or "PAUSE" action yet.
 	 */
 	const bool track_pc_change = (!(qry->flags & QUERY_CACHED) && (qry->flags & QUERY_DNSSEC_WANT));
 	const knot_dname_t *ta_name = qry->zone_cut.trust_anchor ? qry->zone_cut.trust_anchor->owner : NULL;
 	const knot_dname_t *signer = signature_authority(pkt);
-	if (track_pc_change && ta_name && signer && !knot_dname_is_equal(ta_name, signer)) {
+	if (track_pc_change && ta_name && (!signer || !knot_dname_is_equal(ta_name, signer))) {
 		if (ctx->state == KNOT_STATE_YIELD) { /* Already yielded for revalidation. */
 			return KNOT_STATE_FAIL;
 		}
 		DEBUG_MSG(qry, ">< cut changed, needs revalidation\n");
-		if (knot_dname_is_sub(signer, qry->zone_cut.name)) {
+		if (!signer) {
+			/* Not a DNSSEC-signed response, ask parent for DS to prove transition to INSECURE. */
+		} else if (knot_dname_is_sub(signer, qry->zone_cut.name)) {
+			/* Key signer is below current cut, advance and refetch keys. */
 			qry->zone_cut.name = knot_dname_copy(signer, &req->pool);
 		} else if (!knot_dname_is_equal(signer, qry->zone_cut.name)) {
 			/* Key signer is above the current cut, so we can't validate it. This happens when
@@ -344,7 +413,7 @@ static int validate(knot_layer_t *ctx, knot_pkt_t *pkt)
 	/* Check if this is a DNSKEY answer, check trust chain and store. */
 	uint8_t pkt_rcode = knot_wire_get_rcode(pkt->wire);
 	uint16_t qtype = knot_pkt_qtype(pkt);
-	bool has_nsec3 = _knot_pkt_has_type(pkt, KNOT_RRTYPE_NSEC3);
+	bool has_nsec3 = pkt_has_type(pkt, KNOT_RRTYPE_NSEC3);
 	if (knot_wire_get_aa(pkt->wire) && qtype == KNOT_RRTYPE_DNSKEY) {
 		ret = validate_keyset(qry, pkt, has_nsec3);
 		if (ret != 0) {
@@ -358,7 +427,7 @@ static int validate(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (!(qry->flags & QUERY_CACHED) && pkt_rcode == KNOT_RCODE_NXDOMAIN) {
 		/* @todo If knot_pkt_qname(pkt) is used instead of qry->sname then the tests crash. */
 		if (!has_nsec3) {
-			ret = kr_nsec_name_error_response_check(pkt, KNOT_AUTHORITY, qry->sname, &req->pool);
+			ret = kr_nsec_name_error_response_check(pkt, KNOT_AUTHORITY, qry->sname);
 		} else {
 			ret = kr_nsec3_name_error_response_check(pkt, KNOT_AUTHORITY, qry->sname);
 		}
@@ -385,9 +454,15 @@ static int validate(knot_layer_t *ctx, knot_pkt_t *pkt)
 				ret = kr_nsec3_no_data(pkt, KNOT_AUTHORITY, knot_pkt_qname(pkt), knot_pkt_qtype(pkt));
 			}
 			if (ret != 0) {
-				DEBUG_MSG(qry, "<= bad NODATA proof\n");
-				qry->flags |= QUERY_DNSSEC_BOGUS;
-				return KNOT_STATE_FAIL;
+				if (has_nsec3 && (ret == kr_error(DNSSEC_NOT_FOUND))) {
+					DEBUG_MSG(qry, "<= can't prove NODATA due to optout, going insecure\n");
+					qry->flags &= ~QUERY_DNSSEC_WANT;
+					qry->flags |= QUERY_DNSSEC_INSECURE;
+				} else {
+					DEBUG_MSG(qry, "<= bad NODATA proof\n");
+					qry->flags |= QUERY_DNSSEC_BOGUS;
+					return KNOT_STATE_FAIL;
+				}
 			}
 		}
 	}
@@ -403,6 +478,16 @@ static int validate(knot_layer_t *ctx, knot_pkt_t *pkt)
 		}
 	}
 
+	/* Check if wildcard expansion detected for final query.
+	 * If yes, copy authority. */
+	if ((qry->parent == NULL) && (qry->flags & QUERY_DNSSEC_WEXPAND)) {
+		const knot_pktsection_t *auth = knot_pkt_section(pkt, KNOT_AUTHORITY);
+		for (unsigned i = 0; i < auth->count; ++i) {
+			const knot_rrset_t *rr = knot_pkt_rr(auth, i);
+			kr_rrarray_add(&req->authority, rr, &pkt->mm);
+		}
+	}
+
 	/* Check and update current delegation point security status. */
 	ret = update_delegation(req, qry, pkt, has_nsec3);
 	if (ret != 0) {
@@ -410,7 +495,7 @@ static int validate(knot_layer_t *ctx, knot_pkt_t *pkt)
 	}
 	/* Update parent query zone cut */
 	if (qry->parent) {
-		if (update_parent(qry, qtype) != 0) {
+		if (update_parent_keys(qry, qtype) != 0) {
 			return KNOT_STATE_FAIL;
 		}
 	}
@@ -433,3 +518,5 @@ int validate_init(struct kr_module *module)
 }
 
 KR_MODULE_EXPORT(validate)
+
+#undef DEBUG_MSG

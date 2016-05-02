@@ -14,9 +14,34 @@ Enabling DNSSEC
 ===============
 
 The resolver supports DNSSEC including :rfc:`5011` automated DNSSEC TA updates and :rfc:`7646` negative trust anchors.
-To enable it, you need to provide at least _one_ trust anchor. This step is not automatic, as you're supposed to obtain
-the trust anchor `using a secure channel <http://jpmens.net/2015/01/21/opendnssec-rfc-5011-bind-and-unbound/>`_.
-From there, the Knot DNS Resolver can perform automatic updates for you.
+To enable it, you need to provide trusted root keys. Bootstrapping of the keys is automated, and kresd fetches root trust anchors set `over a secure channel <http://jpmens.net/2015/01/21/opendnssec-rfc-5011-bind-and-unbound/>`_ from IANA. From there, it can perform :rfc:`5011` automatic updates for you.
+
+.. note:: Automatic bootstrap requires luasocket_ and luasec_ installed.
+
+.. code-block:: bash
+
+   $ kresd -k root.keys # File for root keys
+   [ ta ] bootstrapped root anchor "19036 8 2 49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5"
+   [ ta ] warning: you SHOULD check the key manually, see: https://data.iana.org/root-anchors/draft-icann-dnssec-trust-anchor.html#sigs
+   [ ta ] key: 19036 state: Valid
+   [ ta ] next refresh: 86400000
+
+Alternatively, you can set it in configuration file with ``trust_anchors.file = 'root.keys'``. If the file doesn't exist, it will be automatically populated with root keys validated using root anchors retrieved over HTTPS.
+
+This is equivalent to `using unbound-anchor <https://www.unbound.net/documentation/howto_anchor.html>`_:
+
+.. code-block:: bash
+
+   $ unbound-anchor -a "root.keys" || echo "warning: check the key at this point"
+   $ echo "auto-trust-anchor-file: \"root.keys\"" >> unbound.conf
+   $ unbound -c unbound.conf
+
+.. warning:: Bootstrapping of the root trust anchors is automatic, you are however **encouraged to check** the key over **secure channel**, as specified in `DNSSEC Trust Anchor Publication for the Root Zone <https://data.iana.org/root-anchors/draft-icann-dnssec-trust-anchor.html#sigs>`_. This is a critical step where the whole infrastructure may be compromised, you will be warned in the server log.
+
+Manually providing root anchors
+-------------------------------
+
+The root anchors bootstrap may fail for various reasons, in this case you need to provide IANA or alternative root anchors. The format of the keyfile is the same as for Unbound or BIND and contains DS/DNSKEY records.
 
 1. Check the current TA published on `IANA website <https://data.iana.org/root-anchors/root-anchors.xml>`_
 2. Fetch current keys (DNSKEY), verify digests
@@ -24,7 +49,7 @@ From there, the Knot DNS Resolver can perform automatic updates for you.
 
 .. code-block:: bash
 
-   $ kdig DNSKEY . @a.root-servers.net +noall +answer | grep 257 > root.keys
+   $ kdig DNSKEY . @k.root-servers.net +noall +answer | grep "DNSKEY[[:space:]]257" > root.keys
    $ ldns-key2ds -n root.keys # Only print to stdout
    ... verify that digest matches TA published by IANA ...
    $ kresd -k root.keys
@@ -99,6 +124,24 @@ of running processes, and you can test the process for liveliness by connecting 
 
 .. warning:: This is very basic way to orchestrate multi-core deployments and doesn't scale in multi-node clusters. Keep an eye on the prepared ``hive`` module that is going to automate everything from service discovery to deployment and consistent configuration.
 
+Running supervised
+==================
+
+Knot Resolver can run under a supervisor to allow for graceful restarts, watchdog process and socket activation. This way the supervisor binds to sockets and lends them to resolver daemon. Thus if the resolver terminates or is killed, the sockets are still active and no queries are dropped.
+
+The watchdog process must notify kresd about active file descriptors, and kresd will automatically determine the socket type and bound address, thus it will appear as any other address. There's a tiny supervisor script for convenience, but you should have a look at `real process managers`_.
+
+.. code-block:: bash
+
+   $ python scripts/supervisor.py ./daemon/kresd 127.0.0.1@53
+   $ [system] interactive mode
+   > quit()
+   > [2016-03-28 16:06:36.795879] process finished, pid = 99342, status = 0, uptime = 0:00:01.720612
+   [system] interactive mode
+   >
+
+The daemon also supports `systemd socket activation`_, it is automatically detected and requires no configuration on users's side.
+
 Configuration
 =============
 
@@ -130,6 +173,8 @@ Configuration example
    -- 10MB cache
    cache.size = 10*MB
 
+.. tip:: There are more configuration examples in `etc/` directory for personal, ISP, company internal and resolver cluster use cases.
+
 Configuration syntax
 --------------------
 
@@ -146,7 +191,7 @@ A simple example would be to load static hints.
 		'hints' -- no configuration
 	}
 
-If the module accepts accepts configuration, you can call the ``module.config({...})`` or provide options table.
+If the module accepts configuration, you can call the ``module.config({...})`` or provide options table.
 The syntax for table is ``{ key1 = value, key2 = value }``, and it represents the unpacked `JSON-encoded`_ string, that
 the modules use as the :ref:`input configuration <mod-properties>`.
 
@@ -182,9 +227,7 @@ This is useful if you're writing a module with a layer, that evaluates an answer
 Dynamic configuration
 ^^^^^^^^^^^^^^^^^^^^^
 
-Knowing that the the configuration is a Lua in disguise enables you to write dynamic rules, and also avoid
-repetition and templating. This is unavoidable with static configuration, e.g. when you want to configure
-each node a little bit differently.
+Knowing that the the configuration is a Lua in disguise enables you to write dynamic rules. It also helps you to avoid repetitive templating that is unavoidable with static configuration.
 
 .. code-block:: lua
 
@@ -292,6 +335,23 @@ Environment
 
    :return: Toggle verbose logging.
 
+.. function:: mode('strict' | 'normal' | 'permissive')
+
+   :return: Change resolver strictness checking level.
+
+   By default, resolver runs in *normal* mode. There are possibly many small adjustments
+   hidden behind the mode settings, but the main idea is that in *permissive* mode, the resolver
+   tries to resolve a name with as few lookups as possible, while in *strict* mode it spends much
+   more effort resolving and checking referral path. However, if majority of the traffic is covered
+   by DNSSEC, some of the strict checking actions are counter-productive.
+
+   .. csv-table::
+    :header: "Action", "Modes"
+
+    "Use mandatory glue", "strict, normal, permissive"
+    "Use in-bailiwick glue", "normal, permissive"
+    "Use any glue records", "permissive"
+
 .. function:: user(name, [group])
 
    :param string name: user name
@@ -327,7 +387,7 @@ Environment
    :param number qtype: Query type (e.g. ``kres.type.NS``)
    :param number qclass: Query class *(optional)* (e.g. ``kres.class.IN``)
    :param number options: Resolution options (see query flags)
-   :param function callback: Callback to be executed when resolution completes (e.g. `function cb (pkt) end`). The callback gets a packet containing the final answer and doesn't have to return anything.
+   :param function callback: Callback to be executed when resolution completes (e.g. `function cb (pkt, req) end`). The callback gets a packet containing the final answer and doesn't have to return anything.
    :return: boolean
 
    Example:
@@ -339,7 +399,7 @@ Environment
 
       -- Query for AAAA record
       resolve('example.com', kres.type.AAAA, kres.class.IN, 0,
-      function (answer)
+      function (answer, req)
          -- Check answer RCODE
          local pkt = kres.pkt_t(answer)
          if pkt:rcode() == kres.rcode.NOERROR then
@@ -462,6 +522,27 @@ For when listening on ``localhost`` just doesn't cut it.
 
 Trust anchors and DNSSEC
 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. envvar:: trust_anchors.hold_down_time = 30 * day
+
+   :return: int (default: 30 * day)
+
+   Modify RFC5011 hold-down timer to given value. Example: ``30 * sec``
+
+.. envvar:: trust_anchors.refresh_time = nil
+
+   :return: int (default: nil)
+
+   Modify RFC5011 refresh timer to given value (not set by default), this will force trust anchors
+   to be updated every N seconds periodically instead of relying on RFC5011 logic and TTLs.
+   Example: ``10 * sec``
+
+.. envvar:: trust_anchors.keep_removed = 0
+
+   :return: int (default: 0)
+
+   How many ``Removed`` keys should be held in history (and key file) before being purged.
+   Note: all ``Removed`` keys will be purged from key file after restarting the process.
 
 .. function:: trust_anchors.config(keyfile)
 
@@ -690,7 +771,16 @@ Scripting worker
 ^^^^^^^^^^^^^^^^
 
 Worker is a service over event loop that tracks and schedules outstanding queries,
-you can see the statistics or schedule new queries.
+you can see the statistics or schedule new queries. It also contains information about
+specified worker count and process rank.
+
+.. envvar:: worker.count
+
+   Return current total worker count (e.g. `1` for single-process)
+
+.. envvar:: worker.id
+
+   Return current worker ID (starting from `0` up to `worker.count - 1`)
 
 .. function:: worker.stats()
 
@@ -700,13 +790,50 @@ you can see the statistics or schedule new queries.
    * ``tcp`` - number of outbound queries over TCP
    * ``ipv6`` - number of outbound queries over IPv6
    * ``ipv4`` - number of outbound queries over IPv4
+   * ``timeout`` - number of timeouted outbound queries
    * ``concurrent`` - number of concurrent queries at the moment
+   * ``queries`` - number of inbound queries
+   * ``dropped`` - number of dropped inbound queries
 
    Example:
 
    .. code-block:: lua
 
 	print(worker.stats().concurrent)
+
+Using CLI tools
+===============
+
+* ``kresd-host.lua`` - a drop-in replacement for *host(1)* utility
+
+Queries the DNS for information.
+The hostname is looked up for IP4, IP6 and mail.
+
+Example:
+
+.. code-block:: bash
+
+	$ kresd-host.lua -f root.key -v nic.cz
+	nic.cz. has address 217.31.205.50 (secure)
+	nic.cz. has IPv6 address 2001:1488:0:3::2 (secure)
+	nic.cz. mail is handled by 10 mail.nic.cz. (secure)
+	nic.cz. mail is handled by 20 mx.nic.cz. (secure)
+	nic.cz. mail is handled by 30 bh.nic.cz. (secure)
+
+* ``kresd-query.lua`` - run the daemon in zero-configuration mode, perform a query and execute given callback.
+
+This is useful for executing one-shot queries and hooking into the processing of the result,
+for example to check if a domain is managed by a certain registrar or if it's signed.
+
+Example:
+
+.. code-block:: bash
+
+	$ kresd-query.lua www.sub.nic.cz 'assert(kres.dname2str(req:resolved().zone_cut.name) == "nic.cz.")' && echo "yes"
+	yes
+	$ kresd-query.lua -C 'trust_anchors.config("root.keys")' nic.cz 'assert(req:resolved():hasflag(kres.query.DNSSEC_WANT))'
+	$ echo $?
+	0
 
 .. _`JSON-encoded`: http://json.org/example
 .. _`Learn Lua in 15 minutes`: http://tylerneylon.com/a/learn-lua/
@@ -715,3 +842,7 @@ you can see the statistics or schedule new queries.
 .. _libuv: https://github.com/libuv/libuv
 .. _Lua: http://www.lua.org/about.html
 .. _LuaJIT: http://luajit.org/luajit.html
+.. _luasec: https://luarocks.org/modules/luarocks/luasec
+.. _luasocket: https://luarocks.org/modules/luarocks/luasocket
+.. _`real process managers`: http://blog.crocodoc.com/post/48703468992/process-managers-the-good-the-bad-and-the-ugly
+.. _`systemd socket activation`: http://0pointer.de/blog/projects/socket-activation.html

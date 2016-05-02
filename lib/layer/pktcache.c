@@ -45,7 +45,7 @@ static void adjust_ttl(knot_rrset_t *rr, uint32_t drift)
 }
 
 static int loot_cache_pkt(struct kr_cache_txn *txn, knot_pkt_t *pkt, const knot_dname_t *qname,
-                          uint16_t rrtype, bool want_secure, uint32_t timestamp)
+                          uint16_t rrtype, bool want_secure, uint32_t timestamp, uint8_t *flags)
 {
 	struct kr_cache_entry *entry = NULL;
 	int ret = kr_cache_peek(txn, KR_CACHE_PKT, qname, rrtype, &entry, &timestamp);
@@ -80,20 +80,25 @@ static int loot_cache_pkt(struct kr_cache_txn *txn, knot_pkt_t *pkt, const knot_
 		}
 	}
 
+	/* Copy cache entry flags */
+	if (flags) {
+		*flags = entry->flags;
+	}
+
 	return ret;
 }
 
 /** @internal Try to find a shortcut directly to searched packet. */
-static int loot_cache(struct kr_cache_txn *txn, knot_pkt_t *pkt, struct kr_query *qry)
+static int loot_pktcache(struct kr_cache_txn *txn, knot_pkt_t *pkt, struct kr_query *qry, uint8_t *flags)
 {
 	uint32_t timestamp = qry->timestamp.tv_sec;
 	const knot_dname_t *qname = qry->sname;
 	uint16_t rrtype = qry->stype;
 	const bool want_secure = (qry->flags & QUERY_DNSSEC_WANT);
-	return loot_cache_pkt(txn, pkt, qname, rrtype, want_secure, timestamp);
+	return loot_cache_pkt(txn, pkt, qname, rrtype, want_secure, timestamp, flags);
 }
 
-static int peek(knot_layer_t *ctx, knot_pkt_t *pkt)
+static int pktcache_peek(knot_layer_t *ctx, knot_pkt_t *pkt)
 {
 	struct kr_request *req = ctx->data;
 	struct kr_query *qry = req->current_query;
@@ -110,16 +115,20 @@ static int peek(knot_layer_t *ctx, knot_pkt_t *pkt)
 	/* Prepare read transaction */
 	struct kr_cache_txn txn;
 	struct kr_cache *cache = &req->ctx->cache;
-	if (kr_cache_txn_begin(cache, &txn, NAMEDB_RDONLY) != 0) {
+	if (kr_cache_txn_begin(cache, &txn, KNOT_DB_RDONLY) != 0) {
 		return ctx->state;
 	}
 
 	/* Fetch either answer to original or minimized query */
-	int ret = loot_cache(&txn, pkt, qry);
+	uint8_t flags = 0;
+	int ret = loot_pktcache(&txn, pkt, qry, &flags);
 	kr_cache_txn_abort(&txn);
 	if (ret == 0) {
 		DEBUG_MSG(qry, "=> satisfied from cache\n");
 		qry->flags |= QUERY_CACHED|QUERY_NO_MINIMIZE;
+		if (flags & KR_CACHE_FLAG_WCARD_PROOF) {
+			qry->flags |= QUERY_DNSSEC_WEXPAND;
+		}
 		pkt->parsed = pkt->size;
 		knot_wire_set_qr(pkt->wire);
 		knot_wire_set_aa(pkt->wire);
@@ -158,7 +167,7 @@ static uint32_t packet_ttl(knot_pkt_t *pkt)
 	return limit_ttl(ttl);
 }
 
-static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
+static int pktcache_stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 {
 	struct kr_request *req = ctx->data;
 	struct kr_query *qry = req->current_query;
@@ -171,11 +180,13 @@ static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (!knot_wire_get_aa(pkt->wire) || knot_pkt_qclass(pkt) != KNOT_CLASS_IN) {
 		return ctx->state;
 	}
-	/* Cache only NODATA/NXDOMAIN or metatype/RRSIG answers. */
+	/* Cache only NODATA/NXDOMAIN or metatype/RRSIG or
+	 * wildcard expanded answers. */
 	const uint16_t qtype = knot_pkt_qtype(pkt);
 	const bool is_eligible = (knot_rrtype_is_metatype(qtype) || qtype == KNOT_RRTYPE_RRSIG);
 	int pkt_class = kr_response_classify(pkt);
-	if (!(is_eligible || (pkt_class & (PKT_NODATA|PKT_NXDOMAIN)))) {
+	if (!(is_eligible || (pkt_class & (PKT_NODATA|PKT_NXDOMAIN)) ||
+	    (qry->flags & QUERY_DNSSEC_WEXPAND))) {
 		return ctx->state;
 	}
 	uint32_t ttl = packet_ttl(pkt);
@@ -191,11 +202,12 @@ static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (kr_cache_txn_begin(&req->ctx->cache, &txn, 0) != 0) {
 		return ctx->state; /* Couldn't acquire cache, ignore. */
 	}
-	namedb_val_t data = { pkt->wire, pkt->size };
+	knot_db_val_t data = { pkt->wire, pkt->size };
 	struct kr_cache_entry header = {
 		.timestamp = qry->timestamp.tv_sec,
 		.ttl = ttl,
 		.rank = KR_RANK_BAD,
+		.flags = KR_CACHE_FLAG_NONE,
 		.count = data.len
 	};
 
@@ -204,6 +216,11 @@ static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 		header.rank = KR_RANK_SECURE;
 	} else if (qry->flags & QUERY_DNSSEC_INSECURE) {
 		header.rank = KR_RANK_INSECURE;
+	}
+
+	/* Set cache flags */
+	if (qry->flags & QUERY_DNSSEC_WANT) {
+		header.flags |= KR_CACHE_FLAG_WCARD_PROOF;
 	}
 
 	/* Check if we can replace (allow current or better rank, SECURE is always accepted). */
@@ -230,11 +247,13 @@ static int stash(knot_layer_t *ctx, knot_pkt_t *pkt)
 const knot_layer_api_t *pktcache_layer(struct kr_module *module)
 {
 	static const knot_layer_api_t _layer = {
-		.produce = &peek,
-		.consume  = &stash
+		.produce = &pktcache_peek,
+		.consume = &pktcache_stash
 	};
 
 	return &_layer;
 }
 
 KR_MODULE_EXPORT(pktcache)
+
+#undef DEBUG_MSG

@@ -78,7 +78,7 @@ static void update_cut_name(struct kr_zonecut *cut, const knot_dname_t *name)
 	cut->name = next_name;
 }
 
-int kr_zonecut_init(struct kr_zonecut *cut, const knot_dname_t *name, mm_ctx_t *pool)
+int kr_zonecut_init(struct kr_zonecut *cut, const knot_dname_t *name, knot_mm_t *pool)
 {
 	if (!cut || !name) {
 		return kr_error(EINVAL);
@@ -223,7 +223,7 @@ int kr_zonecut_add(struct kr_zonecut *cut, const knot_dname_t *ns, const knot_rd
 		return kr_ok();
 	}
 	/* Push new address */
-	int ret = pack_reserve_mm(*pack, 1, rdlen, mm_reserve, cut->pool);
+	int ret = pack_reserve_mm(*pack, 1, rdlen, kr_memreserve, cut->pool);
 	if (ret != 0) {
 		return kr_error(ENOMEM);
 	}
@@ -271,6 +271,8 @@ int kr_zonecut_set_sbelt(struct kr_context *ctx, struct kr_zonecut *cut)
 	if (!ctx || !cut) {
 		return kr_error(EINVAL);
 	}
+	/* @warning _NOT_ thread-safe */
+	static knot_rdata_t rdata_arr[RDATA_ARR_MAX];
 
 	update_cut_name(cut, U8(""));
 	map_walk(&cut->nsset, free_addr_set, cut->pool);
@@ -284,9 +286,8 @@ int kr_zonecut_set_sbelt(struct kr_context *ctx, struct kr_zonecut *cut)
 		/* Copy compiled-in root hints */
 		for (unsigned i = 0; i < HINT_COUNT; ++i) {
 			const struct hint_info *hint = &SBELT[i];
-			knot_rdata_t rdata[knot_rdata_array_size(hint->len)];
-			knot_rdata_init(rdata, hint->len, hint->addr, 0);
-			ret = kr_zonecut_add(cut, hint->name, rdata);
+			knot_rdata_init(rdata_arr, hint->len, hint->addr, 0);
+			ret = kr_zonecut_add(cut, hint->name, rdata_arr);
 			if (ret != 0) {
 				break;
 			}
@@ -298,10 +299,10 @@ int kr_zonecut_set_sbelt(struct kr_context *ctx, struct kr_zonecut *cut)
 /** Fetch address for zone cut. */
 static void fetch_addr(struct kr_zonecut *cut, const knot_dname_t *ns, uint16_t rrtype, struct kr_cache_txn *txn, uint32_t timestamp)
 {
-	uint16_t rank = 0;
+	uint8_t rank = 0;
 	knot_rrset_t cached_rr;
 	knot_rrset_init(&cached_rr, (knot_dname_t *)ns, rrtype, KNOT_CLASS_IN);
-	if (kr_cache_peek_rr(txn, &cached_rr, &rank, &timestamp) != 0) {
+	if (kr_cache_peek_rr(txn, &cached_rr, &rank, NULL, &timestamp) != 0) {
 		return;
 	}
 
@@ -315,13 +316,12 @@ static void fetch_addr(struct kr_zonecut *cut, const knot_dname_t *ns, uint16_t 
 }
 
 /** Fetch best NS for zone cut. */
-static int fetch_ns(struct kr_context *ctx, struct kr_zonecut *cut, const knot_dname_t *name, struct kr_cache_txn *txn, uint32_t timestamp)
+static int fetch_ns(struct kr_context *ctx, struct kr_zonecut *cut, const knot_dname_t *name, struct kr_cache_txn *txn, uint32_t timestamp, uint8_t * restrict rank)
 {
-	uint16_t rank = 0;
 	uint32_t drift = timestamp;
 	knot_rrset_t cached_rr;
 	knot_rrset_init(&cached_rr, (knot_dname_t *)name, KNOT_RRTYPE_NS, KNOT_CLASS_IN);
-	int ret = kr_cache_peek_rr(txn, &cached_rr, &rank, &drift);
+	int ret = kr_cache_peek_rr(txn, &cached_rr, rank, NULL, &drift);
 	if (ret != 0) {
 		return ret;
 	}
@@ -349,17 +349,17 @@ static int fetch_ns(struct kr_context *ctx, struct kr_zonecut *cut, const knot_d
  * Fetch RRSet of given type.
  */
 static int fetch_rrset(knot_rrset_t **rr, const knot_dname_t *owner, uint16_t type,
-                       struct kr_cache_txn *txn, mm_ctx_t *pool, uint32_t timestamp)
+                       struct kr_cache_txn *txn, knot_mm_t *pool, uint32_t timestamp)
 {
 	if (!rr) {
 		return kr_error(ENOENT);
 	}
 
-	uint16_t rank = 0;
+	uint8_t rank = 0;
 	uint32_t drift = timestamp;
 	knot_rrset_t cached_rr;
 	knot_rrset_init(&cached_rr, (knot_dname_t *)owner, type, KNOT_CLASS_IN);
-	int ret = kr_cache_peek_rr(txn, &cached_rr, &rank, &drift);
+	int ret = kr_cache_peek_rr(txn, &cached_rr, &rank, NULL, &drift);
 	if (ret != 0) {
 		return ret;
 	}
@@ -395,7 +395,7 @@ static int fetch_dnskey(struct kr_zonecut *cut, const knot_dname_t *name, struct
 }
 
 int kr_zonecut_find_cached(struct kr_context *ctx, struct kr_zonecut *cut, const knot_dname_t *name,
-                           struct kr_cache_txn *txn, uint32_t timestamp, bool secured)
+                           struct kr_cache_txn *txn, uint32_t timestamp, bool * restrict secured)
 {
 	if (!ctx || !cut || !name) {
 		return kr_error(EINVAL);
@@ -408,17 +408,21 @@ int kr_zonecut_find_cached(struct kr_context *ctx, struct kr_zonecut *cut, const
 	}
 	/* Start at QNAME parent. */
 	while (txn) {
+		/* Fetch NS first and see if it's insecure. */
+		uint8_t rank = 0;
 		const bool is_root = (label[0] == '\0');
-		bool has_ta = !secured || is_root || fetch_ta(cut, label, txn, timestamp) == 0;
-		if (has_ta && fetch_ns(ctx, cut, label, txn, timestamp) == 0) {
-			if (secured) {
+		if (fetch_ns(ctx, cut, label, txn, timestamp, &rank) == 0) {
+			/* Flag as insecure if cached as this */
+			if (rank & KR_RANK_INSECURE)
+				*secured = false;
+			/* Fetch DS if caller wants secure zone cut */
+			if (*secured || is_root) {
+				fetch_ta(cut, label, txn, timestamp);
 				fetch_dnskey(cut, label, txn, timestamp);
 			}
 			update_cut_name(cut, label);
 			mm_free(cut->pool, qname);
 			return kr_ok();
-		} else { /* Clear TA, as it is below any known NS. */
-			knot_rrset_free(&cut->trust_anchor, cut->pool);
 		}
 		/* Subtract label from QNAME. */
 		if (!is_root) {

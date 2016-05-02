@@ -17,7 +17,8 @@
 #pragma once
 
 #include <libknot/rrset.h>
-#include <libknot/internal/namedb/namedb.h>
+#include <libknot/db/db.h>
+#include "lib/defines.h"
 
 /** Cache entry tag */
 enum kr_cache_tag {
@@ -43,6 +44,15 @@ enum kr_cache_rank {
 	/* @note Rank must not exceed 6 bits */
 };
 
+/** Cache entry flags */
+enum kr_cache_flag {
+	KR_CACHE_FLAG_NONE	  = 0,
+	KR_CACHE_FLAG_WCARD_PROOF = 1  /* Entry contains either packet with wildcard
+                                        * answer either record for which wildcard
+                                        * expansion proof is needed */
+};
+
+
 /**
  * Serialized form of the RRSet with inception timestamp and maximum TTL.
  */
@@ -51,7 +61,8 @@ struct kr_cache_entry
 	uint32_t timestamp;
 	uint32_t ttl;
 	uint16_t count;
-	uint16_t rank;
+	uint8_t  rank;
+	uint8_t  flags;
 	uint8_t  data[];
 };
 
@@ -60,8 +71,8 @@ struct kr_cache_entry
  */
 struct kr_cache
 {
-	namedb_t *db;		      /**< Storage instance */
-	const namedb_api_t *api;      /**< Storage engine */
+	knot_db_t *db;		      /**< Storage instance */
+	const knot_db_api_t *api;      /**< Storage engine */
 	struct {
 		uint32_t hit;         /**< Number of cache hits */
 		uint32_t miss;        /**< Number of cache misses */
@@ -74,7 +85,7 @@ struct kr_cache
 
 /** Cache transaction */
 struct kr_cache_txn {
-    namedb_txn_t t;          /**< Storage transaction */  
+    knot_db_txn_t t;          /**< Storage transaction */  
     struct kr_cache *owner;  /**< Transaction owner */
 };
 
@@ -86,13 +97,15 @@ struct kr_cache_txn {
  * @param mm    memory context.
  * @return 0 or an error code
  */
-int kr_cache_open(struct kr_cache *cache, const namedb_api_t *api, void *opts, mm_ctx_t *mm);
+KR_EXPORT
+int kr_cache_open(struct kr_cache *cache, const knot_db_api_t *api, void *opts, knot_mm_t *mm);
 
 /**
  * Close persistent cache.
  * @note This doesn't clear the data, just closes the connection to the database.
  * @param cache database instance
  */
+KR_EXPORT
 void kr_cache_close(struct kr_cache *cache);
 
 /**
@@ -103,6 +116,7 @@ void kr_cache_close(struct kr_cache *cache);
  * @param flags transaction flags (see namedb.h in libknot)
  * @return 0 or an errcode
  */
+KR_EXPORT
 int kr_cache_txn_begin(struct kr_cache *cache, struct kr_cache_txn *txn, unsigned flags);
 
 /**
@@ -110,12 +124,14 @@ int kr_cache_txn_begin(struct kr_cache *cache, struct kr_cache_txn *txn, unsigne
  * @param txn transaction instance
  * @return 0 or an errcode
  */
+KR_EXPORT
 int kr_cache_txn_commit(struct kr_cache_txn *txn);
 
 /**
  * Abort existing transaction instance.
  * @param txn transaction instance
  */
+KR_EXPORT
 void kr_cache_txn_abort(struct kr_cache_txn *txn);
 
 /**
@@ -129,6 +145,7 @@ void kr_cache_txn_abort(struct kr_cache_txn *txn);
  * @param timestamp current time (will be replaced with drift if successful)
  * @return 0 or an errcode
  */
+KR_EXPORT
 int kr_cache_peek(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type,
                   struct kr_cache_entry **entry, uint32_t *timestamp);
 
@@ -144,8 +161,9 @@ int kr_cache_peek(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *nam
  * @param data inserted data
  * @return 0 or an errcode
  */
+KR_EXPORT
 int kr_cache_insert(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type,
-                    struct kr_cache_entry *header, namedb_val_t data);
+                    struct kr_cache_entry *header, knot_db_val_t data);
 
 /**
  * Remove asset from cache.
@@ -155,6 +173,7 @@ int kr_cache_insert(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *n
  * @param type record type
  * @return 0 or an errcode
  */
+KR_EXPORT
 int kr_cache_remove(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type);
 
 /**
@@ -162,6 +181,7 @@ int kr_cache_remove(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *n
  * @param txn transaction instance
  * @return 0 or an errcode
  */
+KR_EXPORT
 int kr_cache_clear(struct kr_cache_txn *txn);
 
 /**
@@ -173,6 +193,7 @@ int kr_cache_clear(struct kr_cache_txn *txn);
  * @param timestamp current time
  * @return rank (0 or positive), or an error (negative number)
  */
+KR_EXPORT
 int kr_cache_peek_rank(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t *name, uint16_t type, uint32_t timestamp);
 
 /**
@@ -181,10 +202,12 @@ int kr_cache_peek_rank(struct kr_cache_txn *txn, uint8_t tag, const knot_dname_t
  * @param txn transaction instance
  * @param rr query RRSet (its rdataset may be changed depending on the result)
  * @param rank entry rank will be stored in this variable
+ * @param flags entry flags
  * @param timestamp current time (will be replaced with drift if successful)
  * @return 0 or an errcode
  */
-int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank, uint32_t *timestamp);
+KR_EXPORT
+int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint8_t *rank, uint8_t *flags, uint32_t *timestamp);
 
 /**
  * Clone read-only RRSet and adjust TTLs.
@@ -194,17 +217,20 @@ int kr_cache_peek_rr(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank,
  * @param mm memory context
  * @return 0 or an errcode
  */
-int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t drift, mm_ctx_t *mm);
+KR_EXPORT
+int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t drift, knot_mm_t *mm);
 
 /**
  * Insert RRSet into cache, replacing any existing data.
  * @param txn transaction instance
  * @param rr inserted RRSet
  * @param rank rank of the data
+ * @param flags additional flags for the data
  * @param timestamp current time
  * @return 0 or an errcode
  */
-int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_t rank, uint32_t timestamp);
+KR_EXPORT
+int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint8_t rank, uint8_t flags, uint32_t timestamp);
 
 /**
  * Peek the cache for the given RRset signature (name, type)
@@ -212,10 +238,12 @@ int kr_cache_insert_rr(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_
  * @param txn transaction instance
  * @param rr query RRSET (its rdataset and type may be changed depending on the result)
  * @param rank entry rank will be stored in this variable
+ * @param flags entry additional flags
  * @param timestamp current time (will be replaced with drift if successful)
  * @return 0 or an errcode
  */
-int kr_cache_peek_rrsig(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *rank, uint32_t *timestamp);
+KR_EXPORT
+int kr_cache_peek_rrsig(struct kr_cache_txn *txn, knot_rrset_t *rr, uint8_t *rank, uint8_t *flags, uint32_t *timestamp);
 
 /**
  * Insert the selected RRSIG RRSet of the selected type covered into cache, replacing any existing data.
@@ -223,7 +251,9 @@ int kr_cache_peek_rrsig(struct kr_cache_txn *txn, knot_rrset_t *rr, uint16_t *ra
  * @param txn transaction instance
  * @param rr inserted RRSIG RRSet
  * @param rank rank of the data
+ * @param flags additional flags for the data
  * @param timestamp current time
  * @return 0 or an errcode
  */
-int kr_cache_insert_rrsig(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint16_t rank, uint32_t timestamp);
+KR_EXPORT
+int kr_cache_insert_rrsig(struct kr_cache_txn *txn, const knot_rrset_t *rr, uint8_t rank, uint8_t flags, uint32_t timestamp);

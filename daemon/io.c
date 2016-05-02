@@ -14,14 +14,35 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <string.h>
 #include <libknot/errcode.h>
-#include <libknot/internal/utils.h>
 #include <contrib/ucw/lib.h>
 #include <contrib/ucw/mempool.h>
 
 #include "daemon/io.h"
 #include "daemon/network.h"
 #include "daemon/worker.h"
+
+#define negotiate_bufsize(func, handle, bufsize_want) do { \
+    int bufsize = 0; func(handle, &bufsize); \
+	if (bufsize < bufsize_want) { \
+		bufsize = bufsize_want; \
+		func(handle, &bufsize); \
+	} \
+} while (0)
+
+static void check_bufsize(uv_handle_t* handle)
+{
+	/* We want to buffer at least N waves in advance.
+	 * This is magic presuming we can pull in a whole recvmmsg width in one wave.
+	 * Linux will double this the bufsize wanted.
+	 */
+	const int bufsize_want = RECVMMSG_BATCH * 65535 * 2;
+	negotiate_bufsize(uv_recv_buffer_size, handle, bufsize_want);
+	negotiate_bufsize(uv_send_buffer_size, handle, bufsize_want);
+}
+
+#undef negotiate_bufsize
 
 static void *handle_alloc(uv_loop_t *loop, size_t size)
 {
@@ -56,13 +77,17 @@ void udp_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
 	uv_loop_t *loop = handle->loop;
 	struct worker_ctx *worker = loop->data;
 	if (nread <= 0) {
-		worker_exec(worker, (uv_handle_t *)handle, NULL, addr);
+		if (nread < 0) { /* Error response, notify resolver */
+			worker_exec(worker, (uv_handle_t *)handle, NULL, addr);
+		} /* nread == 0 is for freeing buffers, we don't need to do this */
 		return;
 	}
 
 	knot_pkt_t *query = knot_pkt_new(buf->base, nread, &worker->pkt_pool);
-	query->max_size = KNOT_WIRE_MAX_PKTSIZE;
-	worker_exec(worker, (uv_handle_t *)handle, query, addr);
+	if (query) {
+		query->max_size = KNOT_WIRE_MAX_PKTSIZE;
+		worker_exec(worker, (uv_handle_t *)handle, query, addr);
+	}
 	mp_flush(worker->pkt_pool.ctx);
 }
 
@@ -76,8 +101,8 @@ int udp_bind(uv_udp_t *handle, struct sockaddr *addr)
 	if (ret != 0) {
 		return ret;
 	}
-
 	handle->data = NULL;
+	check_bufsize((uv_handle_t *)handle);
 	return io_start_read((uv_handle_t *)handle);
 }
 
@@ -155,6 +180,7 @@ void io_create(uv_loop_t *loop, uv_handle_t *handle, int type)
 		uv_udp_init(loop, (uv_udp_t *)handle);
 	} else {
 		uv_tcp_init(loop, (uv_tcp_t *)handle);
+		uv_tcp_nodelay((uv_tcp_t *)handle, 1);
 	}
 }
 

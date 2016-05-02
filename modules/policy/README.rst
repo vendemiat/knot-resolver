@@ -26,7 +26,7 @@ There are several defined actions:
 * ``TC`` - set TC=1 if the request came through UDP, forcing client to retry with TCP
 * ``FORWARD(ip)`` - forward query to given IP and proxy back response (stub mode)
 
-.. note:: The module (and ``kres``) treats domain names as wire, not textual representation. So each label in name is prefixed with its length, e.g. "example.com" equals to ``"\7example\3com"``.
+.. note:: The module (and ``kres``) expects domain names in wire format, not textual representation. So each label in name is prefixed with its length, e.g. "example.com" equals to ``"\7example\3com"``. You can use convenience function ``todname('example.com')`` for automatic conversion.
 
 Example configuration
 ^^^^^^^^^^^^^^^^^^^^^
@@ -63,11 +63,25 @@ Example configuration
 Properties
 ^^^^^^^^^^
 
-.. envvar:: policy.PASS    (number)
-.. envvar:: policy.DENY    (number)
-.. envvar:: policy.DROP    (number)
-.. envvar:: policy.TC      (number)
-.. envvar:: policy.FORWARD (function)
+.. envvar:: policy.PASS
+
+   Pass-through all queries matching the rule.
+
+.. envvar:: policy.DENY
+
+   Respond with NXDOMAIN to all queries matching the rule.
+
+.. envvar:: policy.DROP
+
+   Drop all queries matching the rule.
+
+.. envvar:: policy.TC
+
+   Respond with empty answer with TC bit set (if the query came through UDP).
+
+.. envvar:: policy.FORWARD (address)
+
+   Forward query to given IP address.
 
 .. function:: policy:add(rule)
 
@@ -133,6 +147,20 @@ Properties
    "IP", "no"
    "NSDNAME", "no"
    "NS-IP", "no"
+
+.. function:: policy.todnames({name, ...})
+
+   :param: names table of domain names in textual format
+   
+   Returns table of domain names in wire format converted from strings.
+
+   .. code-block:: lua
+
+      -- Convert single name
+      assert(todname('example.com') == '\7example\3com\0')
+      -- Convert table of names
+      policy.todnames({'example.com', 'me.cz'})
+      { '\7example\3com\0', '\2me\2cz\0' }
 
 .. _`Aho-Corasick`: https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_string_matching_algorithm
 .. _`@jgrahamc`: https://github.com/jgrahamc/aho-corasick-lua

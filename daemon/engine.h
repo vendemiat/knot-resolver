@@ -18,16 +18,19 @@
 
 /* Magic defaults */
 #ifndef LRU_RTT_SIZE
-#define LRU_RTT_SIZE 4096 /**< NS RTT cache size */
+#define LRU_RTT_SIZE 65536 /**< NS RTT cache size */
 #endif
 #ifndef LRU_REP_SIZE
-#define LRU_REP_SIZE (LRU_RTT_SIZE / 2) /**< NS reputation cache size */
+#define LRU_REP_SIZE (LRU_RTT_SIZE / 4) /**< NS reputation cache size */
 #endif
 #ifndef MP_FREELIST_SIZE
-#define MP_FREELIST_SIZE 32 /**< Maximum length of the worker mempool freelist */
+#define MP_FREELIST_SIZE 64 /**< Maximum length of the worker mempool freelist */
 #endif
 #ifndef RECVMMSG_BATCH
-#define RECVMMSG_BATCH 5
+#define RECVMMSG_BATCH 4
+#endif
+#ifndef QUERY_RATE_THRESHOLD
+#define QUERY_RATE_THRESHOLD (2 * MP_FREELIST_SIZE) /**< Nr of parallel queries considered as high rate */
 #endif
 
 /*
@@ -35,29 +38,32 @@
  */
 struct lua_State;
 
+#include "lib/utils.h"
 #include "lib/resolve.h"
 #include "daemon/network.h"
 
 /** Cache storage backend. */
 struct storage_api {
 	const char *prefix; /**< Storage prefix, e.g. 'lmdb://' */
-	const namedb_api_t *(*api)(void); /**< Storage API implementation */
+	const knot_db_api_t *(*api)(void); /**< Storage API implementation */
 	void *(*opts_create)(const char *, size_t); /**< Storage options factory */
 };
 
-/** @internal Array of cache backend options. */
+/** @cond internal Array of cache backend options. */
 typedef array_t(struct storage_api) storage_registry_t;
+/* @endcond */
 
 struct engine {
     struct kr_context resolver;
     struct network net;
     module_array_t modules;
     storage_registry_t storage_registry;
-    mm_ctx_t *pool;
+    knot_mm_t *pool;
+    uv_timer_t *updater;
     struct lua_State *L;
 };
 
-int engine_init(struct engine *engine, mm_ctx_t *pool);
+int engine_init(struct engine *engine, knot_mm_t *pool);
 void engine_deinit(struct engine *engine);
 /** @warning This function leaves 1 string result on stack. */
 int engine_cmd(struct engine *engine, const char *str);

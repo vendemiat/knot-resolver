@@ -16,85 +16,86 @@
 
 #pragma once
 
-#include <libknot/internal/consts.h>
+#include "lib/defines.h"
 #include <libknot/packet/pkt.h>
 
 /**
  * Initialise cryptographic back-end.
  */
+KR_EXPORT
 void kr_crypto_init(void);
 
 /**
  * De-initialise cryptographic back-end.
  */
+KR_EXPORT
 void kr_crypto_cleanup(void);
 
 /**
  * Re-initialise cryptographic back-end.
  * @note Must be called after fork() in the child.
  */
+KR_EXPORT
 void kr_crypto_reinit(void);
 
 /** Opaque DNSSEC key pointer. */
 struct dseckey;
 
+#define KR_DNSSEC_VFLG_WEXPAND 0x01
+
+/** DNSSEC validation context. */
+struct kr_rrset_validation_ctx {
+	const knot_pkt_t *pkt;		/*!< Packet to be validated. */
+	knot_section_t section_id;	/*!< Section to work with. */
+	const knot_rrset_t *keys;	/*!< DNSKEY RRSet. */
+        const knot_dname_t *zone_name;	/*!< Name of the zone containing the RRSIG RRSet. */
+	uint32_t timestamp;		/*!< Validation time. */
+        bool has_nsec3;			/*!< Whether to use NSEC3 validation. */
+	uint32_t flags;			/*!< Output - Flags. */
+	int result;			/*!< Output - 0 or error code. */
+};
+
+typedef struct kr_rrset_validation_ctx kr_rrset_validation_ctx_t;
+
 /**
  * Validate RRSet.
- * @param pkt        Packet to be validated.
- * @param section_id Section to work with.
- * @param covered    RRSet covered by a signature. It must be in canonical format.
- * @param keys       DNSKEY RRSet.
- * @param zone_name  Name of the zone containing the RRSIG RRSet.
- * @param timestamp  Validation time.
- * @param has_nsec3  Whether to use NSEC3 validation.
- * @return           0 or error code.
+ * @param vctx    Pointer to validation context.
+ * @param covered RRSet covered by a signature. It must be in canonical format.
+ * @return        0 or error code, same as vctx->result.
  */
-int kr_rrset_validate(const knot_pkt_t *pkt, knot_section_t section_id,
-                      const knot_rrset_t *covered, const knot_rrset_t *keys,
-                      const knot_dname_t *zone_name, uint32_t timestamp,
-                      bool has_nsec3);
+int kr_rrset_validate(kr_rrset_validation_ctx_t *vctx,
+			const knot_rrset_t *covered);
 
 /**
  * Validate RRSet using a specific key.
- * @param pkt        Packet to be validated.
- * @param section_id Section to work with.
- * @param covered    RRSet covered by a signature. It must be in canonical format.
- * @param keys       DNSKEY RRSet.
- * @param key_pos    Position of the key to be validated with.
- * @param key        Key to be used to validate. If NULL, then key from DNSKEY RRSet is used.
- * @param zone_name  Name of the zone containing the RRSIG RRSet.
- * @param timestamp  Validation time.
- * @param has_nsec3  Whether to use NSEC3 validation.
- * @return           0 or error code.
+ * @param vctx    Pointer to validation context.
+ * @param covered RRSet covered by a signature. It must be in canonical format.
+ * @param key_pos Position of the key to be validated with.
+ * @param key     Key to be used to validate.
+ *		  If NULL, then key from DNSKEY RRSet is used.
+ * @return        0 or error code, same as vctx->result.
  */
-int kr_rrset_validate_with_key(const knot_pkt_t *pkt, knot_section_t section_id,
-                               const knot_rrset_t *covered, const knot_rrset_t *keys,
-                               size_t key_pos, const struct dseckey *key,
-                               const knot_dname_t *zone_name, uint32_t timestamp,
-                               bool has_nsec3);
-
+int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
+				const knot_rrset_t *covered,
+				size_t key_pos, const struct dseckey *key);
 /**
  * Check whether the DNSKEY rrset matches the supplied trust anchor RRSet.
- * @param pkt        Packet to be validated.
- * @param section_id Section to work with.
- * @param keys       DNSKEY RRSet to check.
- * @param ta         Trust anchor RRSet against which to validate the DNSKEY RRSet.
- * @param zone_name  Name of the zone containing the RRSet.
- * @param timestamp  Time stamp.
- * @param has_nsec3  Whether to use NSEC3 validation.
- * @return     0 or error code.
+ * @param vctx Pointer to validation context.
+ * @param ta   Trust anchor RRSet against which to validate the DNSKEY RRSet.
+ * @return     0 or error code, same as vctx->result.
  */
-int kr_dnskeys_trusted(const knot_pkt_t *pkt, knot_section_t section_id, const knot_rrset_t *keys,
-                       const knot_rrset_t *ta, const knot_dname_t *zone_name, uint32_t timestamp,
-                       bool has_nsec3);
+int kr_dnskeys_trusted(kr_rrset_validation_ctx_t *vctx, const knot_rrset_t *ta);
 
 /** Return true if the DNSKEY can be used as a ZSK.  */
+KR_EXPORT KR_PURE
 bool kr_dnssec_key_zsk(const uint8_t *dnskey_rdata);
 
 /** Return true if the DNSKEY indicates being KSK (=> has SEP).  */
+KR_EXPORT KR_PURE
 bool kr_dnssec_key_ksk(const uint8_t *dnskey_rdata);
 
 /** Return true if the DNSKEY is revoked. */
+KR_EXPORT KR_PURE
 bool kr_dnssec_key_revoked(const uint8_t *dnskey_rdata);
 
 /** Return DNSKEY tag.
@@ -103,6 +104,7 @@ bool kr_dnssec_key_revoked(const uint8_t *dnskey_rdata);
   * @param rdlen  RDATA length.
   * @return Key tag (positive number), or an error code
   */
+KR_EXPORT KR_PURE
 int kr_dnssec_key_tag(uint16_t rrtype, const uint8_t *rdata, size_t rdlen);
 
 /** Return 0 if the two keys are identical.
@@ -113,6 +115,7 @@ int kr_dnssec_key_tag(uint16_t rrtype, const uint8_t *rdata, size_t rdlen);
   * @param key_b_rdlen Second key RDATA length
   * @return 0 if they match or an error code
   */
+KR_EXPORT KR_PURE
 int kr_dnssec_key_match(const uint8_t *key_a_rdata, size_t key_a_rdlen,
                         const uint8_t *key_b_rdata, size_t key_b_rdlen);
 

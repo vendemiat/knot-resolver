@@ -1,12 +1,17 @@
 -- LuaJIT ffi bindings for libkres, a DNS resolver library.
 -- @note Since it's statically compiled, it expects to find the symbols in the C namespace.
 
-local ffi = require('ffi')
+local ffi_ok, ffi = pcall(require, 'ffi')
+if not ffi_ok then
+	local M = { error = 'FFI not available, resolver bindings disabled.' }
+	setmetatable(M, {__index = function(t,k,v) error(rawget(M, 'error')) end })
+	return M
+end
 local bit = require('bit')
 local bor = bit.bor
 local band = bit.band
 local C = ffi.C
-local knot = ffi.load(libpath('libknot', '1'))
+local knot = ffi.load(libpath('libknot', '2'))
 ffi.cdef[[
 
 /*
@@ -97,7 +102,12 @@ struct query_flag {
 	static const int NO_CACHE    = 1 << 11;
 	static const int EXPIRING    = 1 << 12;
 	static const int DNSSEC_WANT = 1 << 14;
+	static const int DNSSEC_BOGUS    = 1 << 15;
+	static const int DNSSEC_INSECURE = 1 << 16;
 	static const int STUB        = 1 << 17;
+	static const int ALWAYS_CUT  = 1 << 18;
+	static const int PERMISSIVE  = 1 << 20;
+	static const int STRICT      = 1 << 21;
 };
 
 /*
@@ -105,17 +115,23 @@ struct query_flag {
  */
 
 /* stdlib */
+typedef long time_t;
+struct timeval {
+	time_t tv_sec;
+	time_t tv_usec;
+};
 struct sockaddr {
     uint16_t sa_family;
     uint8_t _stub[]; /* Do not touch */
 };
 
 /* libknot */
+typedef struct {
+	uint8_t _stub[]; /* Do not touch */
+} knot_dump_style_t;
+extern const knot_dump_style_t KNOT_DUMP_STYLE_DEFAULT;
 typedef int knot_section_t; /* Do not touch */
 typedef void knot_rrinfo_t; /* Do not touch */
-typedef struct node {
-  struct node *next, *prev;
-} node_t;
 typedef uint8_t knot_dname_t;
 typedef uint8_t knot_rdata_t;
 typedef struct knot_rdataset {
@@ -168,8 +184,13 @@ typedef struct {
 	size_t len;
 	size_t cap;
 } rr_array_t;
+struct kr_zonecut {
+	knot_dname_t *name;
+	knot_rrset_t *key;
+	knot_rrset_t *trust_anchor;
+	uint8_t _stub[]; /* Do not touch */
+};
 struct kr_query {
-	node_t _node;
 	struct kr_query *parent;
 	knot_dname_t *sname;
 	uint16_t type;
@@ -177,6 +198,8 @@ struct kr_query {
 	uint16_t id;
 	uint32_t flags;
 	unsigned secret;
+	struct timeval timestamp;
+	struct kr_zonecut zone_cut;
 	uint8_t _stub[]; /* Do not touch */
 };
 struct kr_rplan {
@@ -223,6 +246,9 @@ uint16_t knot_rdata_rdlen(const knot_rdata_t *rr);
 uint8_t *knot_rdata_data(const knot_rdata_t *rr);
 knot_rdata_t *knot_rdataset_at(const knot_rdataset_t *rrs, size_t pos);
 uint32_t knot_rrset_ttl(const knot_rrset_t *rrset);
+int knot_rrset_txt_dump_data(const knot_rrset_t *rrset, size_t pos, char *dst, size_t maxlen, const knot_dump_style_t *style);
+int knot_rrset_txt_dump(const knot_rrset_t *rrset, char *dst, size_t maxlen, const knot_dump_style_t *style);
+
 /* Packet */
 const knot_dname_t *knot_pkt_qname(const knot_pkt_t *pkt);
 uint16_t knot_pkt_qtype(const knot_pkt_t *pkt);
@@ -253,6 +279,7 @@ int kr_pkt_put(knot_pkt_t *pkt, const knot_dname_t *name, uint32_t ttl,
                uint16_t rclass, uint16_t rtype, const uint8_t *rdata, uint16_t rdlen);
 int kr_pkt_recycle(knot_pkt_t *pkt);
 const char *kr_inaddr(const struct sockaddr *addr);
+int kr_inaddr_family(const struct sockaddr *addr);
 int kr_inaddr_len(const struct sockaddr *addr);
 int kr_straddr_family(const char *addr);
 int kr_straddr_subnet(void *dst, const char *addr);
@@ -280,10 +307,13 @@ ffi.metatype( sockaddr_t, {
 	__index = {
 		len = function(sa) return C.kr_inaddr_len(sa) end,
 		ip = function (sa) return C.kr_inaddr(sa) end,
+		family = function (sa) return C.kr_inaddr_family(sa) end,
 	}
 })
 
 -- Metatype for RR set
+local rrset_buflen = (64 + 1) * 1024
+local rrset_buf = ffi.new('char[?]', rrset_buflen)
 local knot_rrset_t = ffi.typeof('knot_rrset_t')
 ffi.metatype( knot_rrset_t, {
 	__index = {
@@ -299,6 +329,18 @@ ffi.metatype( knot_rrset_t, {
 			        class = tonumber(rr.class),
 			        type = tonumber(rr.type),
 			        rdata = rr:rdata(i)}
+		end,
+		tostring = function(rr, i)
+			assert(ffi.istype(knot_rrset_t, rr))
+			if rr.rr.count > 0 then
+				local ret = -1
+				if i ~= nil then
+					ret = knot.knot_rrset_txt_dump_data(rr, i, rrset_buf, rrset_buflen, knot.KNOT_DUMP_STYLE_DEFAULT)
+				else
+					ret = knot.knot_rrset_txt_dump(rr, rrset_buf, rrset_buflen, knot.KNOT_DUMP_STYLE_DEFAULT)
+				end
+				return ret >= 0 and ffi.string(rrset_buf)
+			end
 		end,
 	}
 })
@@ -321,9 +363,18 @@ ffi.metatype( knot_pkt_t, {
 			pkt.wire[2] = bor(pkt.wire[2], (val) and 0x02 or 0x00)
 			return band(pkt.wire[2], 0x02)
 		end,
+		rrsets = function (pkt, section_id)
+			local records = {}
+			local section = knot.knot_pkt_section(pkt, section_id)
+			for i = 1, section.count do
+				local rrset = knot.knot_pkt_rr(section, i - 1)
+				table.insert(records, rrset)
+			end
+			return records
+		end,
 		section = function (pkt, section_id)
 			local records = {}
-			local section = C.knot_pkt_section(pkt, section_id)
+			local section = knot.knot_pkt_section(pkt, section_id)
 			for i = 1, section.count do
 				local rrset = knot.knot_pkt_rr(section, i - 1)
 				for k = 1, rrset.rr.count do
@@ -348,12 +399,11 @@ local kr_query_t = ffi.typeof('struct kr_query')
 ffi.metatype( kr_query_t, {
 	__index = {
 		name = function(qry, new_name) return ffi.string(qry.sname, knot.knot_dname_size(qry.sname)) end,
-		next = function(qry)
-			assert(qry)
-			return C.kr_rplan_next(qry)
+		hasflag = function(qry, flag)
+			return band(qry.flags, flag) ~= 0
 		end,
 		resolved = function(qry)
-			return band(qry.flags, kres.query.RESOLVED) ~= 0
+			return qry:hasflag(kres.query.RESOLVED)
 		end,
 		final = function(qry)
 			return qry:resolved() and (qry.parent == nil)
@@ -370,11 +420,15 @@ ffi.metatype( kr_request_t, {
 	__index = {
 		current = function(req)
 			assert(req)
+			if req.current_query == nil then return nil end
 			return req.current_query
 		end,
 		resolved = function(req)
 			assert(req)
-			return C.kr_rplan_resolved(C.kr_resolve_plan(req))
+			qry = C.kr_rplan_resolved(C.kr_resolve_plan(req))
+			if qry == nil then return nil end
+			return qry
+
 		end,
 		push = function(req, qname, qtype, qclass, flags, parent)
 			assert(req)

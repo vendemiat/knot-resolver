@@ -14,12 +14,17 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <assert.h>
 #include <uv.h>
+#include <contrib/cleanup.h>
 #include <libknot/descriptor.h>
 
 #include "lib/cache.h"
 #include "daemon/bindings.h"
 #include "daemon/worker.h"
+
+/** @internal Annotate for static checkers. */
+KR_NORETURN int lua_error (lua_State *L);
 
 /** @internal Prefix error with file:line */
 static int format_error(lua_State* L, const char *err)
@@ -330,11 +335,11 @@ static int cache_backends(lua_State *L)
 static int cache_count(lua_State *L)
 {
 	struct engine *engine = engine_luaget(L);
-	const namedb_api_t *storage = engine->resolver.cache.api;
+	const knot_db_api_t *storage = engine->resolver.cache.api;
 
 	/* Fetch item count */
 	struct kr_cache_txn txn;
-	int ret = kr_cache_txn_begin(&engine->resolver.cache, &txn, NAMEDB_RDONLY);
+	int ret = kr_cache_txn_begin(&engine->resolver.cache, &txn, KNOT_DB_RDONLY);
 	if (ret != 0) {
 		format_error(L, kr_strerror(ret));
 		lua_error(L);
@@ -612,7 +617,8 @@ static void resolve_callback(struct worker_ctx *worker, struct kr_request *req, 
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cb_ref);
 	luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
 	lua_pushlightuserdata(L, req->answer);
-	(void) execute_callback(L, 1);
+	lua_pushlightuserdata(L, req);
+	(void) execute_callback(L, 2);
 }
 
 static int wrk_resolve(lua_State *L)
@@ -682,6 +688,12 @@ static int wrk_stats(lua_State *L)
 	lua_setfield(L, -2, "ipv6");
 	lua_pushnumber(L, worker->stats.ipv4);
 	lua_setfield(L, -2, "ipv4");
+	lua_pushnumber(L, worker->stats.queries);
+	lua_setfield(L, -2, "queries");
+	lua_pushnumber(L, worker->stats.dropped);
+	lua_setfield(L, -2, "dropped");
+	lua_pushnumber(L, worker->stats.timeout);
+	lua_setfield(L, -2, "timeout");
 	return 1;
 }
 

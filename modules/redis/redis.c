@@ -14,7 +14,8 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <libknot/internal/namedb/namedb.h>
+#include <libknot/db/db.h>
+#include <contrib/cleanup.h>
 #include <uv.h>
 
 #include "modules/redis/redis.h"
@@ -23,7 +24,7 @@
 #include "lib/cache.h"
 
 /** @internal Redis API */
-extern const namedb_api_t *namedb_redis_api(void);
+extern const knot_db_api_t *namedb_redis_api(void);
 
 /** @internal Make redis options. */
 void *namedb_redis_mkopts(const char *conf_, size_t maxsize)
@@ -73,6 +74,7 @@ void *namedb_redis_mkopts(const char *conf_, size_t maxsize)
 	return cli;
 }
 
+KR_EXPORT
 int redis_init(struct kr_module *module)
 {
 	struct engine *engine = module->data;
@@ -84,6 +86,7 @@ int redis_init(struct kr_module *module)
 	return kr_ok();
 }
 
+KR_EXPORT
 int redis_deinit(struct kr_module *module)
 {
 	struct engine *engine = module->data;

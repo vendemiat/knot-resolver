@@ -17,15 +17,15 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <contrib/cleanup.h>
+#include <ccan/isaac/isaac.h>
 #include <libknot/descriptor.h>
 #include <libknot/dname.h>
 #include <libknot/rrtype/rrsig.h>
 
-#include "ccan/isaac/isaac.h"
 #include "lib/defines.h"
 #include "lib/utils.h"
 #include "lib/generic/array.h"
@@ -34,7 +34,7 @@
 #include "lib/resolve.h"
 
 /* Logging & debugging */
-bool _env_debug = false;
+static bool _env_debug = false;
 
 /** @internal CSPRNG context */
 static isaac_ctx ISAAC;
@@ -46,22 +46,49 @@ static bool isaac_seeded = false;
  */
 #define strlen_safe(x) ((x) ? strlen(x) : 0)
 
+/**
+ * @internal Convert 16bit unsigned to string, keeps leading spaces.
+ * @note Always fills dst length = 5
+ * Credit: http://computer-programming-forum.com/46-asm/7aa4b50bce8dd985.htm
+ */
+static inline int u16tostr(uint8_t *dst, uint16_t num)
+{
+	uint32_t tmp = num * (((1 << 28) / 10000) + 1) - (num / 4);
+	for(size_t i = 0; i < 5; i++) {
+		dst[i] = '0' + (char) (tmp >> 28);
+		tmp = (tmp & 0x0fffffff) * 10;
+	}
+	return 5;
+}
+
 /*
  * Cleanup callbacks.
  */
-void _cleanup_free(char **p)
+
+/* Always compile-in log symbols, even if disabled. */
+#undef kr_debug_set
+#undef kr_debug_status
+#undef kr_log_debug
+
+bool kr_debug_set(bool status)
 {
-	free(*p);
+	return _env_debug = status;
 }
 
-void _cleanup_close(int *p)
+bool kr_debug_status(void)
 {
-	if (*p > 0) close(*p);
+	return _env_debug;
 }
 
-void _cleanup_fclose(FILE **p)
+void kr_log_debug(const char *fmt, ...)
 {
-	if (*p) fclose(*p);
+	if (_env_debug) {
+		va_list args;
+		va_start(args, fmt);
+		vprintf(fmt, args);
+		va_end(args);
+		fflush(stdout);
+	}
 }
 
 char* kr_strcatdup(unsigned n, ...)
@@ -148,12 +175,12 @@ unsigned kr_rand_uint(unsigned max)
 	return isaac_next_uint(&ISAAC, max);
 }
 
-int mm_reserve(void *baton, char **mem, size_t elm_size, size_t want, size_t *have)
+int kr_memreserve(void *baton, char **mem, size_t elm_size, size_t want, size_t *have)
 {
     if (*have >= want) {
         return 0;
     } else {
-        mm_ctx_t *pool = baton;
+        knot_mm_t *pool = baton;
         size_t next_size = array_next_count(want);
         void *mem_new = mm_alloc(pool, next_size * elm_size);
         if (mem_new != NULL) {
@@ -190,8 +217,10 @@ int kr_pkt_put(knot_pkt_t *pkt, const knot_dname_t *name, uint32_t ttl,
 	/* Create empty RR */
 	knot_rrset_t rr;
 	knot_rrset_init(&rr, knot_dname_copy(name, &pkt->mm), rtype, rclass);
-	/* Create RDATA */
-	knot_rdata_t rdata_arr[knot_rdata_array_size(rdlen)];
+	/* Create RDATA
+	 * @warning _NOT_ thread safe.
+	 */
+	static knot_rdata_t rdata_arr[RDATA_ARR_MAX];
 	knot_rdata_init(rdata_arr, rdlen, rdata, ttl);
 	knot_rdataset_add(&rr.rrs, rdata_arr, &pkt->mm);
 	/* Append RR */
@@ -208,6 +237,13 @@ const char *kr_inaddr(const struct sockaddr *addr)
 	case AF_INET6: return (const char *)&(((const struct sockaddr_in6 *)addr)->sin6_addr);
 	default:       return NULL;
 	}
+}
+
+int kr_inaddr_family(const struct sockaddr *addr)
+{
+	if (!addr)
+		return AF_UNSPEC;
+	return addr->sa_family;
 }
 
 int kr_inaddr_len(const struct sockaddr *addr)
@@ -289,35 +325,46 @@ int kr_bitcmp(const char *a, const char *b, int bits)
 	return ret;
 }
 
-int kr_rrmap_add(map_t *stash, const knot_rrset_t *rr, uint8_t rank, mm_ctx_t *pool)
+int kr_rrkey(char *key, const knot_dname_t *owner, uint16_t type, uint8_t rank)
+{
+	if (!key || !owner) {
+		return kr_error(EINVAL);
+	}
+	key[0] = (rank << 2) | 0x01; /* Must be non-zero */
+	uint8_t *key_buf = (uint8_t *)key + 1;
+	int ret = knot_dname_to_wire(key_buf, owner, KNOT_DNAME_MAXLEN);
+	if (ret <= 0) {
+		return ret;
+	}
+	knot_dname_to_lower(key_buf);
+	key_buf += ret - 1;
+	/* Must convert to string, as the key must not contain 0x00 */
+	ret = u16tostr(key_buf, type);
+	key_buf[ret] = '\0';
+	return (char *)&key_buf[ret] - key;
+}
+
+int kr_rrmap_add(map_t *stash, const knot_rrset_t *rr, uint8_t rank, knot_mm_t *pool)
 {
 	if (!stash || !rr) {
 		return kr_error(EINVAL);
 	}
 
-	/* Stash key = {[1] flags, [1-255] owner, [1-5] type, [1] \x00 } */
-	char key[9 + KNOT_DNAME_MAXLEN];
+	/* Stash key = {[1] flags, [1-255] owner, [5] type, [1] \x00 } */
+	char key[KR_RRKEY_LEN];
+	uint8_t extra_flags = 0;
 	uint16_t rrtype = rr->type;
-	key[0] = (rank << 2) | 0x01; /* Must be non-zero */
-
 	/* Stash RRSIGs in a special cache, flag them and set type to its covering RR.
 	 * This way it the stash won't merge RRSIGs together. */
 	if (rr->type == KNOT_RRTYPE_RRSIG) {
 		rrtype = knot_rrsig_type_covered(&rr->rrs, 0);
-		key[0] |= KEY_FLAG_RRSIG;
+		extra_flags |= KEY_FLAG_RRSIG;
 	}
-
-	uint8_t *key_buf = (uint8_t *)key + 1;
-	int ret = knot_dname_to_wire(key_buf, rr->owner, KNOT_DNAME_MAXLEN);
+	int ret = kr_rrkey(key, rr->owner, rrtype, rank);
 	if (ret <= 0) {
-		return ret;
-	}
-	knot_dname_to_lower(key_buf);
-	/* Must convert to string, as the key must not contain 0x00 */
-	ret = snprintf((char *)key_buf + ret - 1, sizeof(key) - KNOT_DNAME_MAXLEN, "%hu", rrtype);
-	if (ret <= 0 || ret >= KNOT_DNAME_MAXLEN) {
 		return kr_error(EILSEQ);
 	}
+	key[0] |= extra_flags;
 
 	/* Check if already exists */
 	knot_rrset_t *stashed = map_get(stash, key);
@@ -332,9 +379,9 @@ int kr_rrmap_add(map_t *stash, const knot_rrset_t *rr, uint8_t rank, mm_ctx_t *p
 	return knot_rdataset_merge(&stashed->rrs, &rr->rrs, pool);
 }
 
-int kr_rrarray_add(rr_array_t *array, const knot_rrset_t *rr, mm_ctx_t *pool)
+int kr_rrarray_add(rr_array_t *array, const knot_rrset_t *rr, knot_mm_t *pool)
 {
-	int ret = array_reserve_mm(*array, array->len + 1, mm_reserve, pool);
+	int ret = array_reserve_mm(*array, array->len + 1, kr_memreserve, pool);
 	if (ret != 0) {
 		return kr_error(ENOMEM);
 	}

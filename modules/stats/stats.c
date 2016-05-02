@@ -24,6 +24,7 @@
 
 #include <libknot/packet/pkt.h>
 #include <ccan/json/json.h>
+#include <contrib/cleanup.h>
 
 #include "lib/layer/iterate.h"
 #include "lib/rplan.h"
@@ -42,7 +43,7 @@
 
 /** @cond internal Fixed-size map of predefined metrics. */
 #define CONST_METRICS(X) \
-	X(answer,total) X(answer,noerror) X(answer,nxdomain) X(answer,servfail) \
+	X(answer,total) X(answer,noerror) X(answer,nodata) X(answer,nxdomain) X(answer,servfail) \
 	X(answer,cached) X(answer,10ms) X(answer,100ms) X(answer,1000ms) X(answer,slow) \
 	X(query,edns) X(query,dnssec) \
 	X(const,end)
@@ -86,7 +87,12 @@ static int collect_answer(struct stat_data *data, knot_pkt_t *pkt)
 	stat_const_add(data, metric_answer_total, 1);
 	/* Count per-rcode */
 	switch(knot_wire_get_rcode(pkt->wire)) {
-	case KNOT_RCODE_NOERROR:  stat_const_add(data, metric_answer_noerror, 1); break;
+	case KNOT_RCODE_NOERROR:
+		if (knot_wire_get_ancount(pkt->wire) > 0)
+			stat_const_add(data, metric_answer_noerror, 1);
+		else
+			stat_const_add(data, metric_answer_nodata, 1);
+	break;
 	case KNOT_RCODE_NXDOMAIN: stat_const_add(data, metric_answer_nxdomain, 1); break;
 	case KNOT_RCODE_SERVFAIL: stat_const_add(data, metric_answer_servfail, 1); break;
 	default: break;
@@ -109,9 +115,9 @@ static void collect_sample(struct stat_data *data, struct kr_rplan *rplan, knot_
 {
 	/* Sample key = {[2] type, [1-255] owner} */
 	char key[sizeof(uint16_t) + KNOT_DNAME_MAXLEN];
-	struct kr_query *qry = NULL;
-	WALK_LIST(qry, rplan->resolved) {
+	for (size_t i = 0; i < rplan->resolved.len; ++i) {
 		/* Sample queries leading to iteration or expiring */
+		struct kr_query *qry = rplan->resolved.at[i];
 		if ((qry->flags & QUERY_CACHED) && !(qry->flags & QUERY_EXPIRING)) {
 			continue;
 		}
@@ -140,10 +146,10 @@ static int collect(knot_layer_t *ctx)
 	collect_answer(data, param->answer);
 	collect_sample(data, rplan, param->answer);
 	/* Count cached and unresolved */
-	if (!EMPTY_LIST(rplan->resolved)) {
+	if (rplan->resolved.len > 0) {
 		/* Histogram of answer latency. */
-		struct kr_query *first = HEAD(rplan->resolved);
-		struct kr_query *last = TAIL(rplan->resolved);
+		struct kr_query *first = rplan->resolved.at[0];
+		struct kr_query *last = array_tail(rplan->resolved);
 		struct timeval now;
 		gettimeofday(&now, NULL);
 		long elapsed = time_diff(&first->timestamp, &now);
@@ -324,6 +330,7 @@ static char* clear_expiring(void *env, struct kr_module *module, const char *arg
  * Module implementation.
  */
 
+KR_EXPORT
 const knot_layer_api_t *stats_layer(struct kr_module *module)
 {
 	static knot_layer_api_t _layer = {
@@ -334,6 +341,7 @@ const knot_layer_api_t *stats_layer(struct kr_module *module)
 	return &_layer;
 }
 
+KR_EXPORT
 int stats_init(struct kr_module *module)
 {
 	struct stat_data *data = malloc(sizeof(*data));
@@ -353,6 +361,7 @@ int stats_init(struct kr_module *module)
 	return kr_ok();
 }
 
+KR_EXPORT
 int stats_deinit(struct kr_module *module)
 {
 	struct stat_data *data = module->data;
@@ -367,6 +376,7 @@ int stats_deinit(struct kr_module *module)
 	return kr_ok();
 }
 
+KR_EXPORT
 struct kr_prop *stats_props(void)
 {
 	static struct kr_prop prop_list[] = {

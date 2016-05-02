@@ -14,14 +14,15 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <libknot/internal/namedb/namedb.h>
+#include <libknot/db/db.h>
+#include <contrib/cleanup.h>
 
 #include "daemon/engine.h"
 #include "lib/module.h"
 #include "lib/cache.h"
 
 /** @internal Memcached API */
-extern const namedb_api_t *namedb_memcached_api(void);
+extern const knot_db_api_t *namedb_memcached_api(void);
 
 /** @internal Make memcached options. */
 void *namedb_memcached_mkopts(const char *conf, size_t maxsize)
@@ -29,6 +30,7 @@ void *namedb_memcached_mkopts(const char *conf, size_t maxsize)
 	return strdup(conf);
 }
 
+KR_EXPORT
 int kmemcached_init(struct kr_module *module)
 {
 	struct engine *engine = module->data;
@@ -40,6 +42,7 @@ int kmemcached_init(struct kr_module *module)
 	return kr_ok();
 }
 
+KR_EXPORT
 int kmemcached_deinit(struct kr_module *module)
 {
 	struct engine *engine = module->data;
