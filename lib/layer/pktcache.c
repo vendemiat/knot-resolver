@@ -107,7 +107,7 @@ static int pktcache_peek(knot_layer_t *ctx, knot_pkt_t *pkt)
 	if (ctx->state & (KNOT_STATE_FAIL|KNOT_STATE_DONE) || (qry->flags & QUERY_NO_CACHE)) {
 		return ctx->state; /* Already resolved/failed */
 	}
-	if (qry->ns.addr[0].ip.sa_family != AF_UNSPEC) {
+	if (qry->ns.addr[0].ip.sa_family != AF_UNSPEC && !(qry->flags & QUERY_STUB)) {
 		return ctx->state; /* Only lookup before asking a query */
 	}
 	if (knot_pkt_qclass(pkt) != KNOT_CLASS_IN) {

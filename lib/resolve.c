@@ -408,9 +408,12 @@ static int query_finalize(struct kr_request *request, struct kr_query *qry, knot
 		if (ret == 0) {
 			/* Stub resolution (ask for +rd and +do) */
 			if (qry->flags & QUERY_STUB) {
-				knot_wire_set_rd(pkt->wire);
-				if (knot_pkt_has_dnssec(request->answer))
+				if (knot_wire_get_rd(request->answer->wire)) {
+					knot_wire_set_rd(pkt->wire);
+				}
+				if (knot_pkt_has_dnssec(request->answer)) {
 					knot_edns_set_do(pkt->opt_rr);
+				}
 			/* Full resolution (ask for +cd and +do) */
 			} else if (qry->flags & QUERY_DNSSEC_WANT) {
 				knot_edns_set_do(pkt->opt_rr);
@@ -824,15 +827,19 @@ int kr_resolve_produce(struct kr_request *request, struct sockaddr **dst, int *t
 		return kr_rplan_empty(rplan) ? KNOT_STATE_DONE : KNOT_STATE_PRODUCE;
 	}
 	
-
-	/* This query has RD=0 or is ANY, stop here. */
-	if (qry->stype == KNOT_RRTYPE_ANY || !knot_wire_get_rd(request->answer->wire)) {
-		DEBUG_MSG(qry, "=> qtype is ANY or RD=0, bail out\n");
+	/* This query is for ANY type, stop here. */
+	if (qry->stype == KNOT_RRTYPE_ANY) {
+		DEBUG_MSG(qry, "=> qtype is ANY, bail\n");
 		return KNOT_STATE_FAIL;
 	}
-
-	/* Update zone cut, spawn new subrequests. */
+	
 	if (!(qry->flags & QUERY_STUB)) {
+		/* Bail if not stub and RD=0 */
+		if (!knot_wire_get_rd(request->answer->wire)) {
+			DEBUG_MSG(qry, "=> RD bit 0, bail\n");
+			return KNOT_STATE_FAIL;
+		}
+		/* Update zone cut, spawn new subrequests. */
 		int state = zone_cut_check(request, qry, packet);
 		switch(state) {
 		case KNOT_STATE_FAIL: return KNOT_STATE_FAIL;
@@ -882,9 +889,13 @@ ns_election:
 	}
 
 	/* Randomize query case (if not in safemode) */
-	qry->secret = (qry->flags & QUERY_SAFEMODE) ? 0 : kr_rand_uint(UINT32_MAX);
-	knot_dname_t *qname_raw = (knot_dname_t *)knot_pkt_qname(packet);
-	randomized_qname_case(qname_raw, qry->secret);
+	if (!(qry->flags & (QUERY_SAFEMODE|QUERY_STUB))) {
+		knot_dname_t *qname_raw = (knot_dname_t *)knot_pkt_qname(packet);
+		qry->secret = kr_rand_uint(UINT32_MAX);
+		randomized_qname_case(qname_raw, qry->secret);
+	} else {
+		qry->secret = 0;
+	}
 
 	/*
 	 * Additional query is going to be finalised when calling

@@ -97,7 +97,7 @@ static inline void req_release(struct worker_ctx *worker, struct req *req)
 }
 
 /*! @internal Create a UDP/TCP handle */
-static uv_handle_t *ioreq_spawn(struct qr_task *task, int socktype)
+static uv_handle_t *ioreq_spawn(struct qr_task *task, int socktype, struct sockaddr *addr)
 {
 	if (task->pending_count >= MAX_PENDING) {
 		return NULL;
@@ -573,9 +573,9 @@ static void on_timeout(uv_timer_t *req)
 static bool retransmit(struct qr_task *task)
 {
 	if (task && task->addrlist && task->addrlist_count > 0) {
-		uv_handle_t *subreq = ioreq_spawn(task, SOCK_DGRAM);
+		struct sockaddr_in6 *choice = &((struct sockaddr_in6 *)task->addrlist)[task->addrlist_turn];
+		uv_handle_t *subreq = ioreq_spawn(task, SOCK_DGRAM, (struct sockaddr *)choice);
 		if (subreq) { /* Create connection for iterative query */
-			struct sockaddr_in6 *choice = &((struct sockaddr_in6 *)task->addrlist)[task->addrlist_turn];
 			if (qr_task_send(task, subreq, (struct sockaddr *)choice, task->pktbuf) == 0) {
 				task->addrlist_turn = (task->addrlist_turn + 1) % task->addrlist_count; /* Round robin */
 				return true;
@@ -639,7 +639,6 @@ static void subreq_finalize(struct qr_task *task, const struct sockaddr *packet_
 	char key[KR_RRKEY_LEN];
 	int ret = subreq_key(key, task->pktbuf);
 	if (ret > 0) {
-		assert(map_get(&task->worker->outgoing, key) == task);
 		map_del(&task->worker->outgoing, key);
 	}
 	/* Notify waiting tasks. */
@@ -665,7 +664,6 @@ static void subreq_lead(struct qr_task *task)
 	assert(task);
 	char key[KR_RRKEY_LEN];
 	if (subreq_key(key, task->pktbuf) > 0) {
-		assert(map_contains(&task->worker->outgoing, key) == false);
 		map_set(&task->worker->outgoing, key, task);
 		task->leading = true;
 	}
@@ -735,11 +733,14 @@ static int qr_task_step(struct qr_task *task, const struct sockaddr *packet_sour
 		choice += 1;
 	}
 
+	/* Do not deduplicate in stub mode */
+	struct kr_query *qry = array_tail(task->req.rplan.pending);
+	const bool is_stub = (qry->flags & QUERY_STUB);
 	/* Start fast retransmit with UDP, otherwise connect. */
 	int ret = 0;
 	if (sock_type == SOCK_DGRAM) {
 		/* If there is already outgoing query, enqueue to it. */
-		if (subreq_enqueue(task)) {
+		if (!is_stub && subreq_enqueue(task)) {
 			return kr_ok(); /* Will be notified when outgoing query finishes. */
 		}
 		/* Start transmitting */
@@ -751,13 +752,15 @@ static int qr_task_step(struct qr_task *task, const struct sockaddr *packet_sour
 		/* Announce and start subrequest.
 		 * @note Only UDP can lead I/O as it doesn't touch 'task->pktbuf' for reassembly.
 		 */
-		subreq_lead(task);
+		 if (!is_stub) {
+			subreq_lead(task);
+		 }
 	} else {
 		uv_connect_t *conn = (uv_connect_t *)req_borrow(task->worker);
 		if (!conn) {
 			return qr_task_step(task, NULL, NULL);
 		}
-		uv_handle_t *client = ioreq_spawn(task, sock_type);
+		uv_handle_t *client = ioreq_spawn(task, sock_type, NULL);
 		if (!client) {
 			req_release(task->worker, (struct req *)conn);
 			return qr_task_step(task, NULL, NULL);
