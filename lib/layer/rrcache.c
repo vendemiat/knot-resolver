@@ -174,7 +174,7 @@ static int commit_rr(const char *key, void *val, void *data)
 {
 	knot_rrset_t *rr = val;
 	struct rrcache_baton *baton = data;
-	/* Ensure minimum TTL */
+	/* Ensure minimum/maximum TTL */
 	knot_rdata_t *rd = rr->rrs.data;
 	for (uint16_t i = 0; i < rr->rrs.rr_count; ++i) {
 		if (knot_rdata_ttl(rd) < baton->min_ttl) {
@@ -220,7 +220,7 @@ static int stash_commit(map_t *stash, struct kr_query *qry, struct kr_cache *cac
 		.qry = qry,
 		.cache = cache,
 		.timestamp = qry->timestamp.tv_sec,
-		.min_ttl = DEFAULT_MINTTL
+		.min_ttl = MAX(DEFAULT_MINTTL, cache->ttl_min),
 	};
 	return map_walk(stash, &commit_rr, &baton);
 }
