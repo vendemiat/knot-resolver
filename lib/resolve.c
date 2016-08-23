@@ -400,6 +400,7 @@ static int query_finalize(struct kr_request *request, struct kr_query *qry, knot
 	/* Randomize query case (if not in safemode) */
 	qry->secret = (qry->flags & QUERY_SAFEMODE) ? 0 : kr_rand_uint(UINT32_MAX);
 	knot_dname_t *qname_raw = (knot_dname_t *)knot_pkt_qname(pkt);
+	knot_dname_to_lower(qname_raw);
 	randomized_qname_case(qname_raw, qry->secret);
 
 	int ret = 0;
