@@ -341,7 +341,15 @@ int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t dr
 
 	/* Copy valid records */
 	knot_rdata_t *rd = src->rrs.data;
-	for (uint16_t i = 0; i < src->rrs.rr_count; ++i) {
+
+	uint16_t start_rr = time(NULL)%src->rrs.rr_count;
+	kr_log_error("[cache] round-robin start: %d\n", start_rr);
+	
+	for (uint16_t i = 0; i < start_rr; i++) {
+		rd = kr_rdataset_next(rd);
+	}
+	
+	for (uint16_t i = start_rr; i < src->rrs.rr_count; ++i) {
 		if (knot_rdata_ttl(rd) >= drift) {
 			if (knot_rdataset_add(&dst->rrs, rd, mm) != 0) {
 				knot_rrset_clear(dst, mm);
@@ -350,6 +358,18 @@ int kr_cache_materialize(knot_rrset_t *dst, const knot_rrset_t *src, uint32_t dr
 		}
 		rd = kr_rdataset_next(rd);
 	}
+
+	rd = src->rrs.data;
+	for (uint16_t i = 0; i < start_rr; i++) {
+		if (knot_rdata_ttl(rd) >= drift) {
+			if (knot_rdataset_add(&dst->rrs, rd, mm) != 0) {
+				knot_rrset_clear(dst, mm);
+				return kr_error(ENOMEM);
+			}
+		}
+		rd = kr_rdataset_next(rd);
+	}		
+	
 	/* Fixup TTL by time passed */
 	rd = dst->rrs.data;
 	for (uint16_t i = 0; i < dst->rrs.rr_count; ++i) {
