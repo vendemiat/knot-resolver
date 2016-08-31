@@ -27,6 +27,7 @@
 #include "contrib/ucw/lib.h"
 
 /** Some built-in unfairness ... */
+#define FAVOUR_IPV4 0 /* no bonus for v4 */
 #define FAVOUR_IPV6 20 /* 20ms bonus for v6 */
 
 /** @internal Macro to set address structure. */
@@ -93,6 +94,7 @@ static unsigned eval_addr_set(pack_t *addr_set, kr_nsrep_lru_t *rttcache, unsign
 			favour = FAVOUR_IPV6;
 		} else {
 			is_valid = !(opts & QUERY_NO_IPV4);
+			favour = FAVOUR_IPV4;
 		}
 		/* Get RTT for this address (if known) */
 		if (is_valid) {
@@ -133,7 +135,7 @@ static int eval_nsrep(const char *k, void *v, void *baton)
 	pack_t *addr_set = (pack_t *)v;
 	if (addr_set->len == 0) {
 		score = KR_NS_UNKNOWN;
-		/* If the server doesn't have IPv6, give it disadvantage. */
+		/* If the server doesn't have IPv6, alter the score. */
 		if (reputation & KR_NS_NOIP6) {
 			score += FAVOUR_IPV6;
 			/* If the server is unknown but has rep record, treat it as timeouted */
@@ -141,6 +143,9 @@ static int eval_nsrep(const char *k, void *v, void *baton)
 				score = KR_NS_UNKNOWN;
 				reputation = 0; /* Start with clean slate */
 			}
+		} else if (reputation & KR_NS_NOIP4) {
+			/* If the server doesn't have IPv4, alter the score. */
+			score += FAVOUR_IPV4;
 		}
 	} else {
 		score = eval_addr_set(addr_set, ctx->cache_rtt, score, addr_choice, ctx->options);
